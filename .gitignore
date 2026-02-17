@@ -1,0 +1,64 @@
+# -------------------------
+# Secrets / local overrides
+# -------------------------
+.env
+.env.*
+!.env.example
+
+# -------------------------
+# Runtime data (DO NOT COMMIT)
+# -------------------------
+data/
+volumes/
+
+# If you store model/tag snapshots locally and don't want them committed:
+config/approved_model_tags.json
+config/*tags*.json
+
+# Logs (in case you ever write logs outside ./data/logs)
+*.log
+
+# -------------------------
+# Python artifacts
+# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+coverage.xml
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# -------------------------
+# Build / packaging
+# -------------------------
+build/
+dist/
+*.whl
+
+# -------------------------
+# OS / editor junk
+# -------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# -------------------------
+# Jupyter
+# -------------------------
+.ipynb_checkpoints/

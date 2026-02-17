@@ -1,0 +1,21 @@
+source .env
+docker compose -f compose.yaml up -d  # starts ollama (app is profile-gated)
+
+docker compose -f compose.yaml --profile manual run --rm app \
+  --in_dir /data/input \
+  --out_dir /data/output \
+  --text_out_dir /data/text_out \
+  --log_dir /data/logs
+docker compose -f compose.yaml down
+
+# If I changed my code
+docker compose -f compose.yaml build app
+# when you finish running it
+docker compose -f compose.seed.yaml down
+curl http://127.0.0.1:11434/api/tags > config/approved_model_tags.json
+
+
+#When download models
+docker compose -f compose.seed.yaml up -d
+docker exec -it ollama_seed ollama pull qwen2.5:14b-instruct (model of your own choices)
+docker compose -f compose.seed.yaml down

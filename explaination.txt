@@ -1,0 +1,473 @@
+Below is a **final, self-contained, copy/pasteable runbook** for: **Windows + WSL2 + NVIDIA GPU (16GB)**, running **Ollama + your Python pipeline entirely in Docker**, with a **one-time online seed** to download models, and a **fully offline runtime** that **does not expose port 11434** to your computer/LAN/internet. (No proxy.)
+
+---
+
+# End-to-end steps (no proxy, secure internal-only Ollama)
+
+## What you get
+
+* **Seed phase (online, temporary):** download models into `./volumes/ollama/`
+* **Runtime phase (offline):** Ollama + your `ner_app` run on an **internal Docker network**; Ollama is **not reachable from host**; `ner_app` calls Ollama internally.
+* Clear **input/output folders**:
+
+  * Inputs: `./data/input/`
+  * Outputs: `./data/output/`, `./data/text_out/`, `./data/logs/`
+
+---
+
+## 0) Prereqs (Windows + WSL2 + GPU)
+
+### 0.1 Install WSL2 + Ubuntu
+
+In elevated PowerShell:
+
+```powershell
+wsl --install
+```
+
+Install Ubuntu (Microsoft Store) if needed.
+
+### 0.2 Install NVIDIA driver (WSL compatible)
+
+Install the latest NVIDIA driver that supports WSL2 GPU compute. Reboot.
+
+### 0.3 Install Docker Desktop
+
+Enable:
+
+* “Use WSL 2 based engine”
+* WSL integration for your Ubuntu distro
+
+### 0.4 Verify GPU + Docker from WSL Ubuntu
+
+```bash
+nvidia-smi
+docker version
+docker run --rm --gpus all nvidia/cuda:12.3.2-base-ubuntu22.04 nvidia-smi
+```
+
+If that prints your GPU, you’re good.
+
+---
+
+## 1) Create project folders/files (run from repo root)
+
+From the root folder where `ner_extract.py` lives:
+
+```bash
+mkdir -p app config data/input data/output data/text_out data/logs volumes/ollama
+touch compose.seed.yaml compose.yaml requirements.txt .env.example .dockerignore
+```
+
+---
+
+## 2) Add the required project files
+
+### 2.1 `.dockerignore` (repo root)
+
+```dockerignore
+volumes/
+data/
+__pycache__/
+*.pyc
+.git/
+```
+
+### 2.2 `requirements.txt` (repo root)
+
+```txt
+requests>=2.31.0
+```
+
+### 2.3 `app/Dockerfile`
+
+Runs as **non-root**.
+
+```dockerfile
+FROM python:3.11-slim
+
+RUN useradd --system --uid 10001 --shell /usr/sbin/nologin appuser
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY ner_extract.py /app/ner_extract.py
+
+USER 10001:10001
+
+ENTRYPOINT ["python", "/app/ner_extract.py"]
+```
+
+### 2.4 `.env.example` (repo root)
+
+```bash
+OLLAMA_MODEL=qwen2.5:14b-instruct
+```
+
+Create `.env`:
+
+```bash
+cp .env.example .env
+```
+
+---
+
+## 3) Seed phase (ONLINE, temporary): download Ollama models
+
+### Goal
+
+Download models into `./volumes/ollama/` so runtime can be offline.
+
+### 3.1 `compose.seed.yaml` (online model seeding)
+
+**Important:** binds to localhost only: `127.0.0.1:11434` so it’s not reachable from LAN/internet.
+
+```yaml
+services:
+  ollama_seed:
+    image: ollama/ollama:latest
+    container_name: ollama_seed
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NO_CLOUD=1
+      - HOME=/home/ollama
+    user: "10001:10001"
+    volumes:
+      - ./volumes/ollama:/home/ollama/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+```
+
+### 3.2 Start seed Ollama
+
+```bash
+docker compose -f compose.seed.yaml up -d
+```
+
+### 3.3 Pull model(s)
+
+```bash
+docker exec -it ollama_seed ollama pull qwen2.5:14b-instruct
+# Optional fallback smaller model:
+docker exec -it ollama_seed ollama pull llama3.2:latest
+```
+
+### 3.4 Save a model “approved snapshot” (optional but recommended)
+
+This records what models/digests you have locally.
+
+```bash
+curl http://127.0.0.1:11434/api/tags > config/approved_model_tags.json
+```
+
+### 3.5 Stop seed
+
+```bash
+docker compose -f compose.seed.yaml down
+```
+
+**Seed security note:** This phase is “inbound safe” (localhost only), but it’s online for downloads. Don’t process sensitive documents here.
+
+---
+
+## 4) Runtime phase (OFFLINE): run Ollama + pipeline securely
+
+### Goal
+
+* Ollama **not exposed to host** (no `ports:`).
+* Containers run on `internal: true` network → **no internet egress**.
+* `ner_app` calls Ollama internally: `http://ollama:11434`.
+
+### 4.1 `compose.yaml` (offline runtime)
+
+```yaml
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NO_CLOUD=1
+      - HOME=/home/ollama
+    user: "10001:10001"
+    volumes:
+      - ./volumes/ollama:/home/ollama/.ollama
+    networks:
+      - llm_internal
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: ner_app
+    depends_on:
+      - ollama
+    networks:
+      - llm_internal
+
+    volumes:
+      - ./data/input:/data/input:ro
+      - ./data/output:/data/output
+      - ./data/text_out:/data/text_out
+      - ./data/logs:/data/logs
+
+    profiles: ["manual"]
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  llm_internal:
+    internal: true
+```
+
+### 4.2 Start runtime Ollama
+
+```bash
+docker compose -f compose.yaml up -d
+```
+
+### 4.3 Confirm host cannot access 11434 (expected)
+
+This should fail:
+
+```bash
+curl http://127.0.0.1:11434/api/tags
+```
+
+### 4.4 Confirm Ollama works internally (optional)
+
+```bash
+docker run --rm --network $(basename "$PWD")_llm_internal curlimages/curl \
+  http://ollama:11434/api/tags
+```
+
+---
+
+## 5) Run the pipeline (inputs/outputs)
+
+### 5.1 Put OCR/text files into input folder
+
+```bash
+cp /path/to/files/*.txt data/input/
+```
+
+### 5.2 Run the job container (reads existing `data/input/`)
+
+```bash
+source .env
+
+docker compose -f compose.yaml --profile manual run --rm app \
+  --in_dir /data/input \
+  --out_dir /data/output \
+  --text_out_dir /data/text_out \
+  --log_dir /data/logs \
+  --model "$OLLAMA_MODEL" \
+  --ollama_url "http://ollama:11434/api/generate"
+```
+
+### 5.3 Outputs are written to host
+
+* `data/output/`
+* `data/text_out/`
+* `data/logs/`
+
+### 5.4 Stop runtime (optional)
+
+```bash
+docker compose -f compose.yaml down
+```
+
+(Models remain in `./volumes/ollama/`.)
+
+---
+
+## 6) Running it again in the future (common workflows)
+
+### A) You already have input files, just run again
+
+```bash
+docker compose -f compose.yaml up -d
+
+source .env
+docker compose -f compose.yaml --profile manual run --rm app \
+  --in_dir /data/input \
+  --out_dir /data/output \
+  --text_out_dir /data/text_out \
+  --log_dir /data/logs \
+  --model "$OLLAMA_MODEL" \
+  --ollama_url "http://ollama:11434/api/generate"
+```
+
+### B) You changed Python code and need rebuild
+
+```bash
+docker compose -f compose.yaml build app
+```
+
+Then run as usual.
+
+### C) You want to download more models later (seed again)
+
+```bash
+docker compose -f compose.seed.yaml up -d
+docker exec -it ollama_seed ollama pull <model-name>
+curl http://127.0.0.1:11434/api/tags > config/approved_model_tags.json
+docker compose -f compose.seed.yaml down
+```
+
+---
+
+## 7) Where to see errors (syntax error, stack traces, etc.)
+
+### If `app` fails (syntax error, exceptions)
+
+You’ll see it **in the terminal** where you ran:
+
+```bash
+docker compose ... run --rm app ...
+```
+
+If you want to save logs to a file every run:
+
+```bash
+source .env
+docker compose -f compose.yaml --profile manual run --rm app \
+  --in_dir /data/input \
+  --out_dir /data/output \
+  --text_out_dir /data/text_out \
+  --log_dir /data/logs \
+  --model "$OLLAMA_MODEL" \
+  --ollama_url "http://ollama:11434/api/generate" \
+  2>&1 | tee data/logs/app_run_$(date +%Y%m%d_%H%M%S).log
+```
+
+### If Ollama errors
+
+```bash
+docker logs ollama --tail 200
+```
+
+---
+
+## 8) Why port 11434 is secure here
+
+* In runtime, Ollama listens on `11434` **inside the container**, but you do **not** publish it to the host (no `ports:`).
+* Therefore **your computer does not have `localhost:11434` open**.
+* Only containers on the private Docker network `llm_internal` can reach `http://ollama:11434`.
+* `internal: true` also blocks internet egress from those containers.
+
+Optional belt-and-suspenders (Windows): add a firewall rule blocking inbound TCP 11434, but in runtime there’s nothing listening on the host anyway.
+
+---
+
+# Final file structure chart
+
+```text
+<repo-root>/
+├─ ner_extract.py
+├─ requirements.txt
+├─ .env
+├─ .env.example
+├─ .dockerignore
+├─ compose.seed.yaml
+├─ compose.yaml
+│
+├─ app/
+│  └─ Dockerfile
+│
+├─ config/
+│  └─ approved_model_tags.json
+│
+├─ data/
+│  ├─ input/
+│  ├─ output/
+│  ├─ text_out/
+│  └─ logs/
+│
+└─ volumes/
+   └─ ollama/
+```
+
+---
+
+# Flow charts
+
+## A) Seed phase (online, temporary)
+
+```text
+HOST (Windows/WSL2)
+
+Ports:
+  127.0.0.1:11434  -->  ollama_seed:11434
+
+Files:
+  ./volumes/ollama/  <->  /home/ollama/.ollama  (models persist)
+
++---------------------------+
+| Container: ollama_seed    |
+|---------------------------|
+| Host port: 127.0.0.1:11434|
+| Internal: :11434          |
+| Writes models to mounted  |
+| /home/ollama/.ollama      |
++---------------------------+
+```
+
+## B) Runtime phase (offline, secure)
+
+```text
+HOST (Windows/WSL2)
+
+Ports:
+  none published (host cannot reach 11434)
+
+Network:
+  llm_internal (internal-only; no internet)
+
+Files:
+  app reads:  ./data/input   -> /data/input (ro)
+  app writes: ./data/output  -> /data/output
+             ./data/text_out -> /data/text_out
+             ./data/logs     -> /data/logs
+  ollama models: ./volumes/ollama -> /home/ollama/.ollama
+
+           internal HTTP: http://ollama:11434/api/generate
++----------------------+        +----------------------+
+| Container: ner_app   | -----> | Container: ollama    |
+| (one-off job)        |        | (service)            |
+| no ports exposed     |        | no ports exposed     |
++----------------------+        +----------------------+
+```
+
+---
+
+If you want one extra convenience step, you can add a `scripts/run.sh` wrapper later—but the commands above are already the minimal reliable workflow.

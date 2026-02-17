@@ -1,0 +1,52 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NO_CLOUD=1
+      - HOME=/home/ollama
+    user: "10001:10001"
+    volumes:
+      - ./volumes/ollama:/home/ollama/.ollama
+    networks:
+      - llm_internal
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: ner_app
+    depends_on:
+      - ollama
+    networks:
+      - llm_internal
+
+    volumes:
+      - ./data/input:/data/input:ro
+      - ./data/output:/data/output
+      - ./data/text_out:/data/text_out
+      - ./data/logs:/data/logs
+
+    profiles: ["manual"]
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  llm_internal:
+    internal: true
