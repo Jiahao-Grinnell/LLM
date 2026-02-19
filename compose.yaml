@@ -46,6 +46,27 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+  
+  ocr_app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile.ocr
+    container_name: ocr_app
+    depends_on:
+      - ollama
+    networks:
+      - llm_internal
+
+    volumes:
+      - ./data/ocr_input_images:/data/input_images:ro
+      - ./data/ocr_output_text:/data/output_text
+
+    profiles: ["manual"]
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 networks:
   llm_internal:

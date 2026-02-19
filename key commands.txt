@@ -8,8 +8,19 @@ docker compose -f compose.yaml --profile manual run --rm app \
   --log_dir /data/logs
 docker compose -f compose.yaml down
 
+
+#or if run ocr model
+# Run OCR by overriding entrypoint so Dockerfile ENTRYPOINT can't swallow your args
+docker compose run --rm ocr_app \
+  --model "glm-ocr:latest" \
+  --in_dir /data/input_images \
+  --out_dir /data/output_text \
+  --ollama_url "http://ollama:11434/api/generate"
+
+
+
 # If I changed my code
-docker compose -f compose.yaml build app
+docker compose -f compose.yaml build --no-cache app
 # when you finish running it
 docker compose -f compose.seed.yaml down
 curl http://127.0.0.1:11434/api/tags > config/approved_model_tags.json
