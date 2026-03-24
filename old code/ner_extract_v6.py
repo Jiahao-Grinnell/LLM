@@ -312,7 +312,7 @@ OCR TEXT:
 <<<{ocr}>>>
 """
 
-PLACE_PASS_PROMPT = """You are extracting the PAGE-LOCAL places for one named slave from one OCR page.
+PLACE_PASS_PROMPT = """You are extracting page-local places for one named slave from ONE OCR page.
 
 Target slave name: {name}
 
@@ -333,15 +333,24 @@ Return JSON only:
 
 Rules:
 - Preserve the FULL target name exactly as given.
-- Use ONLY this page. Do not infer from neighboring pages or earlier/later case pages.
-- Extract every real named place explicitly linked to {name} on this page.
-- order = 1,2,3,... ONLY for a clear personal movement sequence or an explicit transport sequence on this page.
-- order = 0 for weak admin/naval/context/intended places, including memo routing, office/header places, maintenance locations, certificate-delivery locations, desired future residence, requested repatriation destination, and similar non-life-route context.
-- Shared-list pages matter: if one sentence governs several listed names, apply the shared places to this target name too.
-- Transport/admin pages matter: capture page-local places from wording like from X to Y, passage to Y, repatriation to Y, arrived at Y, refugee slaves from X, taken to Y, handed to Y, maintaining at X.
-- Do NOT turn ship names, office labels, ticket text, or naval rendezvous locations into personal route steps.
-- arrival_date should be ISO only when a date is explicitly tied to the movement/place on this page. Do NOT infer dates from age text like "aged about 20 years" or vague background phrases alone.
-- time_text should keep a short phrase like "arrived at Bahrain by the S.S. Bandra", "provided with a deck passage to Bombay", or "likes to stay at Ras al Khaimah".
+- Use ONLY the current OCR page. Do not assume facts from earlier or later pages.
+- Extract EVERY real named place explicitly linked to {name} on this page.
+- Include full route places when the page contains a statement or an actual transport movement on this page: born at/in, native of, kidnapped from, imported to, brought to, taken to, sent to, sold at/in/to a man of, landed at, reached, escaped to, took refuge at, recorded at, from X to Y, arrived at Y, Muscat to Bombay per s.s., or the following refugee slaves from X arrived at Y.
+- If one sentence applies to a vertical list of names, apply that shared place statement to every listed name on the page.
+- Also include page-local administrative places when they are clearly relevant to the named slave on this page, such as:
+  * repatriation to X
+  * onward journey to X
+  * passage / ticket from X to Y or passage to X
+  * likes to stay / live at X
+  * took refuge in the Agency / came to the Agency Office (use the page header location if explicit)
+  * certificates for delivery to the named slave on this page (use the page header location if explicit)
+  * certificates handed to the named slave on this page (use the page header location if explicit)
+  * maintenance / shelter / residence at the Agency or Residency on this page (use the page header location if explicit)
+- Keep chronological order only when the page clearly states an actual route or transport that happened on this page.
+- Use order = 1,2,3,... for a clear chronological route.
+- Use order = 0 for weak or non-chronological page-local administrative places (for example intended residence, repatriation destination, delivery location, agency location, maintenance location).
+- arrival_date should be ISO when possible; otherwise null.
+- time_text should keep a short phrase like "four days ago", "Recorded on 21st November 1934", "for delivery", or "per s.s. Bandra".
 - evidence must be <=25 words.
 - Do not invent places.
 - Output JSON only.
@@ -350,7 +359,7 @@ OCR TEXT:
 <<<{ocr}>>>
 """
 
-PLACE_RECALL_PROMPT = """Extract any missed PAGE-LOCAL places for the named slave below.
+PLACE_RECALL_PROMPT = """Extract any missed page-local places for the named slave below.
 
 Target slave name: {name}
 
@@ -370,13 +379,18 @@ Return JSON only:
 }}
 
 Focus on places often missed in OCR pages:
-- shared-list route pages such as "the following refugee slaves from X arrived at Y"
-- transport/admin pages such as "Muscat to Bombay per s.s. ...", "repatriation to Zanzibar", "deck passage to Bombay", "taken to Muscat"
-- intended / requested places like "likes to stay at Ras al Khaimah" or "allowed to live in Hinjam" (use order=0 unless the page clearly states actual movement)
-- page header/admin locations when the text says this Agency / Residency Agency and the location is explicit in the header (use order=0 unless the page clearly states actual arrival)
-- first-person route wording such as kidnapped from X, brought me to Y, sold me at Z, escaped to W, sent me to V
-
-Preserve full names and output JSON only.
+- OCR variants like Debai/ebai, Shargah, Bahrein, Mekran, Boashakird
+- shared-list route pages such as "the following refugee slaves from X arrived at Y" followed by several names
+- transport / receipt pages such as "NAME Muscat to Bombay per s.s. Bandra" or "provided with a deck passage ... to Bombay"
+- repatriation / onward-journey destinations such as repatriation to Zanzibar or onward journey to Bombay
+- same-page administrative places linked to the named slave:
+  * likes to stay at X / live at X
+  * took refuge in the Agency / came to the Agency Office (use header location if explicit)
+  * certificate delivered / handed to the named slave on this page (use header location if explicit)
+  * thumb impression / maintenance / residence at the Agency or Residency on this page
+- Use order = 1,2,3,... only for clear actual route/transport.
+- Keep order = 0 for weak or non-chronological but relevant page-local places.
+- Preserve full names and output JSON only.
 
 OCR TEXT:
 <<<{ocr}>>>
@@ -444,7 +458,6 @@ def normalize_name(raw: str) -> str:
     s = normalize_ws(s)
     s = s.strip(" ,.;:[]{}\"'")
     s = re.sub(r"^(?:Mst|Mrs|Miss|Mr)\.?\s+", "", s, flags=re.I)
-    s = re.sub(r"^(?:the\s+)?slave\s+", "", s, flags=re.I)
     s = re.sub(r"\bslave\s*no\.?\s*\d+\b", "", s, flags=re.I)
     s = re.sub(r"\bslave\s*no\.?\b.*$", "", s, flags=re.I)
     s = re.sub(r"\b(ibn)\b", "bin", s, flags=re.I)
@@ -583,7 +596,6 @@ def normalize_place(raw: str) -> str:
     s = s.replace("—", "-")
     s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
     s = re.sub(r"\bof\s+Negro\s+slave\s+parents\b.*$", "", s, flags=re.I)
-    s = _transport_tail_strip(s)
     if not s:
         return ""
 
@@ -597,9 +609,9 @@ def normalize_place(raw: str) -> str:
 
     s = re.sub(r"^(?:the\s+)?(?:residency\s+agency|political\s+agency|british\s+government'?s?\s+residency\s+agency|the\s+agency|this\s+agency)\b[, ]*", "", s, flags=re.I)
     s = re.sub(r"^(?:the\s+)?(?:town|port|island|coast)\s+of\s+", "", s, flags=re.I)
-    s = re.sub(r"^(?:at|in|to|from|near|off|via)\s+", "", s, flags=re.I)
+    s = re.sub(r"^(?:at|in|to|from|near|off)\s+", "", s, flags=re.I)
     s = re.split(
-        r"\b(?:named|where|who|whom|which|when|that|while|during|after|before|because|for\s+the\s+purpose|for\s+delivery|recorded|signed|dated|having|leaving|left|tomorrow|yesterday|safely|some\s+months?\s+ago|about\s+\d+\s+(?:years?|months?|days?)\s+ago|\d+\s+(?:years?|months?|days?)\s+(?:ago|previously)|as\s+slaves?\s+to|being\s+sent|intended\s+to|wanted\s+to|kindly\s+arrange|requested\s+to\s+arrange|requested\s+that|with\s+thumb|thumb\s+impressions?|expenses\s+incurred|maintenance|maintaining|ticket|passage|receipt|copy\s+forwarded|and\s+sold\s+to|and\s+was\s+leaving|and\s+were\s+protected|and\s+protected|in\s+a\s+(?:show|boat|dhow|boom|sambuk|sambuks|jallibaut)|in\s+accordance\s+with|whom\b|where\b)\b",
+        r"\b(?:named|where|who|whom|which|when|that|while|during|after|before|because|for\s+the\s+purpose|for\s+delivery|recorded|signed|dated|having|leaving|left|tomorrow|yesterday|safely|some\s+months?\s+ago|about\s+\d+\s+(?:years?|months?|days?)\s+ago|\d+\s+(?:years?|months?|days?)\s+(?:ago|previously)|as\s+slaves?\s+to|being\s+sent|intended\s+to|wanted\s+to|by\s+the|by\s+s\.?s\.?|per\s+s\.?s\.?|per\s+ss\.?|on\s+board|voy\.?|with\s+food|without\s+food|at\s+a\s+cost|cost\s+of)\b",
         s,
         maxsplit=1,
         flags=re.I,
@@ -609,7 +621,7 @@ def normalize_place(raw: str) -> str:
     if not s:
         return ""
     low_s = s.lower()
-    if low_s in {"the residency agency", "residency agency", "political agency", "the agency", "this agency", "and", "the", "statement", "memorandum"}:
+    if low_s in {"the residency agency", "residency agency", "political agency", "the agency", "this agency"}:
         return ""
     if re.match(r"^(?:the\s+)?house\s+of\b", low_s):
         return ""
@@ -632,13 +644,7 @@ def normalize_place(raw: str) -> str:
         return mapped
     if len(s) <= 3 and s.isupper():
         return s
-    words = [w for w in low.split(" ") if w and w not in {"and", "the", "a", "an"}]
-    if not words:
-        return ""
-    cleaned = " ".join(words)
-    if cleaned in {"and", "the", "statement", "memorandum"}:
-        return ""
-    return " ".join([w[:1].upper() + w[1:] if w else w for w in cleaned.split(" ")])
+    return " ".join([w[:1].upper() + w[1:] if w else w for w in low.split(" ")])
 
 
 def is_valid_place(place: str) -> bool:
@@ -671,111 +677,11 @@ def is_valid_place(place: str) -> bool:
         return False
     return True
 
-
-def is_suspicious_place_string(place: str) -> bool:
-    low = normalize_ws(place).lower()
-    if not low:
-        return False
-    if low in {"and", "the", "statement", "memorandum", "copy", "approved", "politic", "trade"}:
-        return True
-    if re.search(r"\b(?:by\s+the|per\s+s\.?s\.?|by\s+s\.?s\.?|voy\.?|with\s+food|without\s+food|at\s+a\s+cost|cost\s+of)\b", low):
-        return True
-    if re.search(r"\b(?:ticket|passage|receipt|commissioner|police|thumb\s+impressions?|copy\s+forwarded)\b", low):
-        return True
-    return False
-
-
-def evidence_has_strong_route(ev: str) -> bool:
-    low = normalize_ws(ev).lower()
-    return bool(re.search(
-        r"\b(born\s+(?:at|in)|native\s+of|originally\s+lived\s+at|lived\s+at|moved\s+to|kidnapped\s+(?:me|him|her)?\s*from|captured\s+(?:me|him|her)?\s*from|brought\s+(?:me|him|her)?\s+to|taken\s+to|sent\s+(?:me|him|her)?\s+to|was\s+sent\s+to|sold\s+(?:me|him|her)?|arrived\s+at|reached\s+|landed\s+at|escaped(?:\s+and)?\s+to|took\s+refuge\s+at|from\s+[A-Za-z][A-Za-z'’\- ]+\s+to\s+[A-Za-z][A-Za-z'’\- ]+|the\s+following\s+refugee\s+slaves\s+from\s+[A-Za-z].*?arrived\s+at\s+[A-Za-z])\b",
-        low,
-        flags=re.I,
-    ))
-
-
-def evidence_is_admin_or_naval(ev: str) -> bool:
-    low = normalize_ws(ev).lower()
-    return bool(re.search(
-        r"\b(re-joined\s+you\s+in|lying\s+off|h\.?m\.?s\.?|officer\s+commanding|elphinstone\s+inlet|political\s+agency|residency\s+agent|copy\s+forwarded|submitted\s+for\s+information|memorandum|thumb\s+impressions?|maintaining|expenses\s+incurred|ticket|receipt|deck\s+passage|onward\s+journey|for\s+delivery\s+to|handed\s+(?:the\s+same|them|him|her)\s+to|likes?\s+to\s+stay|allowed\s+to\s+live|wishes?\s+to\s+live|desired\s+destination|repatriation(?:\s+of|\s+to)?)\b",
-        low,
-        flags=re.I,
-    ))
-
-
-def evidence_supports_arrival_date(ev: str) -> bool:
-    low = normalize_ws(ev).lower()
-    if not low:
-        return False
-    if not DATE_PAT.search(ev) and not re.search(r"\b(?:some\s+months?\s+ago|about\s+\d+\s+(?:years?|months?|days?)\s+ago|\d+\s+(?:years?|months?|days?)\s+(?:ago|previously)|\d+\s+or\s+\d+\s+years?\s+ago)\b", low):
-        return False
-    return bool(re.search(r"\b(arrived|reached|landed|recorded|dated|sent\s+(?:me|him|her)?\s+to|was\s+sent\s+to|taken\s+to|brought\s+(?:me|him|her)?\s+to|escaped(?:\s+and)?\s+to|took\s+refuge\s+at|from\s+[A-Za-z][A-Za-z'’\- ]+\s+to\s+[A-Za-z][A-Za-z'’\- ]+)\b", low, flags=re.I))
-
-
-def postprocess_places_for_page(current_ocr: str, page_type: str, places: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not places:
-        return []
-    header_loc = extract_header_location(current_ocr)
-    seen: Dict[str, Dict[str, Any]] = {}
-    for p in places:
-        place = normalize_place(str(p.get("place") or p.get("Place") or ""))
-        if not place or not is_valid_place(place) or is_suspicious_place_string(place):
-            continue
-        row = dict(p)
-        row["place"] = place
-        ev = normalize_ws(str(row.get("evidence") or ""))
-        try:
-            order = int(row.get("order", 0) or 0)
-        except Exception:
-            order = 0
-
-        if evidence_is_admin_or_naval(ev) and not evidence_has_strong_route(ev):
-            order = 0
-        if place == "Bushehr" and page_type != "administrative_memo" and evidence_is_admin_or_naval(ev):
-            continue
-        if page_type == "administrative_memo" and not evidence_has_strong_route(ev):
-            order = 0
-        if header_loc and place == header_loc and page_type in {"administrative_memo", "administrative_route"} and not evidence_has_strong_route(ev):
-            order = 0
-
-        if row.get("arrival_date") and not evidence_supports_arrival_date(ev):
-            row["arrival_date"] = ""
-            row["date_confidence"] = ""
-
-        row["order"] = order
-        key = place.lower()
-        cur = seen.get(key)
-        if cur is None:
-            seen[key] = row
-        else:
-            cur_order = int(cur.get("order", 0) or 0)
-            if cur_order == 0 and order > 0:
-                cur["order"] = order
-            elif order > 0 and cur_order > 0:
-                cur["order"] = min(cur_order, order)
-            if not cur.get("arrival_date") and row.get("arrival_date"):
-                cur["arrival_date"] = row.get("arrival_date", "")
-                cur["date_confidence"] = row.get("date_confidence", "")
-            if row.get("time_text") and len(str(row.get("time_text") or "")) > len(str(cur.get("time_text") or "")):
-                cur["time_text"] = row.get("time_text", "")
-            if row.get("evidence") and len(str(row.get("evidence") or "")) > len(str(cur.get("evidence") or "")):
-                cur["evidence"] = row.get("evidence", "")
-
-    positives = [dict(v) for v in seen.values() if int(v.get("order", 0) or 0) > 0]
-    zeroes = [dict(v) for v in seen.values() if int(v.get("order", 0) or 0) == 0]
-    positives.sort(key=lambda x: (int(x.get("order", 0) or 0), normalize_place(str(x.get("place") or ""))))
-    for i, row in enumerate(positives, start=1):
-        row["order"] = i
-    zeroes.sort(key=lambda x: normalize_place(str(x.get("place") or "")))
-    return positives + zeroes
-
-
 def sentence_split(text: str) -> List[str]:
     text = text.replace("\r", "\n")
     parts = re.split(r"(?<=[\.!?])\s+|\n{2,}", text)
     out = [normalize_ws(p) for p in parts if normalize_ws(p)]
     return out
-
 
 
 def sentence_around(text: str, idx: int, max_words: int = 25) -> str:
@@ -1230,21 +1136,6 @@ def deterministic_listed_names(ocr: str) -> List[Dict[str, str]]:
     out: Dict[str, Dict[str, str]] = {}
     text = ocr or ""
 
-    m_under = re.search(r"the\s+undermentioned\s+fugitive\s+slaves[^.]*\.", text, flags=re.I)
-    if m_under:
-        block = text[m_under.end():m_under.end()+900]
-        for line in block.splitlines():
-            line_n = normalize_ws(re.sub(r"\(.*?\)", " ", line))
-            if not line_n:
-                continue
-            if re.search(r"\b(?:provisions|value|total|quarter|article|reference|date|submitted|fresh\s+bread|fresh\s+meat|potatoes|rice|milk|sugar|tea|lbs|tins)\b", line_n, flags=re.I):
-                continue
-            line_n = re.sub(r"-?do-?\.?$", "", line_n, flags=re.I)
-            line_n = re.sub(r"\b\d{1,2}(?:st|nd|rd|th)?\b.*$", "", line_n).strip(" ,.;:-")
-            nm = _extract_name_from_piece(line_n)
-            if nm:
-                _add_name_candidate(out, nm, line_n)
-
     for m in LIST_NAME_SEG_PAT.finditer(text):
         seg = re.split(r"[.;:\n]", m.group(1))[0]
         seg = LIST_CLEAN_PAT.sub(" ", seg)
@@ -1270,9 +1161,9 @@ def deterministic_listed_names(ocr: str) -> List[Dict[str, str]]:
             _add_name_candidate(out, nm, sentence_around(text, m.start()) or normalize_ws(m.group(0)))
 
     seg_pats = [
-        r"forward\s+herewith[^.\n]{0,320}?\bby\s+(.{0,420})",
-        r"made\s+before\s+me\s+by(?:\s+the\s+refugee\s+slaves,)?\s*(.{0,420})",
-        r"for\s+delivery\s+to\s*:?\s*(.{0,420})",
+        r"forward\s+herewith[^.\n]{0,220}?\bby\s+(.{0,260})",
+        r"made\s+before\s+me\s+by(?:\s+the\s+refugee\s+slaves,)?\s*(.{0,260})",
+        r"for\s+delivery\s+to\s*:?\s*(.{0,260})",
         r"to\s+say\s+that\s+(.{0,180}?)\s+were\s+given\s+Manumission\s+Certificates",
         r"the\s+following\s+refugee\s+slaves[^.\n]{0,120}?:\s*(.{0,260})",
         r"forwarded\s+herewith\s+for\s+favour\s+of\s+delivery\s+to\s+(.{0,220})",
@@ -1287,21 +1178,6 @@ def deterministic_listed_names(ocr: str) -> List[Dict[str, str]]:
                 nm = _extract_name_from_piece(piece)
                 if nm:
                     _add_name_candidate(out, nm, sentence_around(text, m.start()) or seg)
-
-    undermentioned = re.search(r"the\s+undermentioned\s+fugitive\s+slaves[^.]*[:.]?", text, flags=re.I)
-    if undermentioned:
-        block = text[undermentioned.end():undermentioned.end()+700]
-        for line in block.splitlines():
-            line_n = normalize_ws(re.sub(r"\(.*?\)", " ", line))
-            if not line_n:
-                continue
-            if re.search(r"\b(date|submitted|provisions|value|total|reference|article|quarter|inclusive|march|april|lbs|tins|fresh|rice|milk|sugar|tea)\b", line_n, flags=re.I):
-                continue
-            line_n = re.sub(r"-?do-?\.?$", "", line_n, flags=re.I)
-            line_n = re.sub(r"\b\d{1,2}(?:st|nd|rd|th)?\b.*$", "", line_n).strip(" ,.;:-")
-            nm = _extract_name_from_piece(line_n)
-            if nm:
-                _add_name_candidate(out, nm, line_n)
 
     list_heading = re.search(r"(?:the\s+following\s+refugee\s+slaves[^.]*\.|First\s+batch\s+of\s+slaves|Second\s+batch\s+of\s+slaves|the\s+persons\s+concerned\s+are)\s*[:.]?", text, flags=re.I)
     if list_heading:
@@ -1346,7 +1222,7 @@ PLACE_REGEXES = [
     (re.compile(rf"(?i:\b(?:was|were)\s+sent\s+to\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\bwere\s+to\s+send\s+to\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\btaken\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\btaken\b[^\n\.;:]{0,80}?\bto\s+)" + PLACE_CAPTURE), "route"),
+    (re.compile(rf"(?i:\btaken\b[^\n\.;:]{0,80}?\bto\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\bthence(?:\s+shipped\s+me\s+in\s+a\s+boat\s+and\s+landed\s+me\s+at|\s+to|\s+landed\s+me\s+at)\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\bfrom\s+there\s+(?:he\s+)?(?:took|brought|sent)\s+(?:me|him|her)?(?:\s+in\s+a\s+boat)?\s+to\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\bfrom\s+there\s+to\s+)" + PLACE_CAPTURE), "route"),
@@ -1354,10 +1230,10 @@ PLACE_REGEXES = [
     (re.compile(rf"(?i:\blanded\s+(?:me|him|her)?\s+at\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\bembark(?:ed)?\s+(?:me|him|her)?(?:\s+in\s+a\s+boat)?\s+and\s+brought\s+(?:me|him|her)?\s+to\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\bsold\s+(?:me|him|her)?\s*to\s+(?:one|a\s+man|man)\s+of\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\bsold\s+(?:me|him|her)?\s*to\s+[^\n\.\,;:]{0,80}?\bat\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\bsold\s+(?:me|him|her)?\s*to\s+[^\n\.\,;:]{0,80}?\bin\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\bprotected\s+by\s+[^\n\.\,;:]{0,80}?\bat\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\b(?:escaped|escape(?:d)?)\s+(?:with\s+[^\n\.]{0,40}?\s+)?to\s+)" + PLACE_CAPTURE), "route"),
+    (re.compile(rf"(?i:\bsold\s+(?:me|him|her)?\s*to\s+[^\n\.\,;:]{0,80}?\bat\s+)" + PLACE_CAPTURE), "route"),
+    (re.compile(rf"(?i:\bsold\s+(?:me|him|her)?\s*to\s+[^\n\.\,;:]{0,80}?\bin\s+)" + PLACE_CAPTURE), "route"),
+    (re.compile(rf"(?i:\bprotected\s+by\s+[^\n\.\,;:]{0,80}?\bat\s+)" + PLACE_CAPTURE), "route"),
+    (re.compile(rf"(?i:\b(?:escaped|escape(?:d)?)\s+(?:with\s+[^\n\.]{0,40}?\s+)?to\s+)" + PLACE_CAPTURE), "route"),
     (re.compile(rf"(?i:\bcomplained(?:\s+twice)?\s+to\s+.*?\b(?:Agent|Chief),?\s*)" + PLACE_CAPTURE), "assoc"),
     (re.compile(rf"(?i:\brecorded\s+at\s+(?:the\s+Political\s+Agency,?\s*)?)" + PLACE_CAPTURE), "assoc"),
     (re.compile(rf"(?i:\bborn\s+at\s+)" + PLACE_CAPTURE), "route"),
@@ -1402,14 +1278,6 @@ def derive_relative_arrival(snippet: str, doc_year: Optional[int], anchor_date: 
     if not doc_year and anchor_date:
         doc_year = anchor_date.year
 
-    movement_hint = bool(re.search(
-        r"\b(arrived|reached|landed|recorded|sent\s+(?:me|him|her)?\s+to|was\s+sent\s+to|taken\s+to|brought\s+(?:me|him|her)?\s+to|escaped(?:\s+and)?\s+to|took\s+refuge\s+at|moved\s+to|from\s+[A-Za-z][A-Za-z'’\- ]+\s+to\s+[A-Za-z][A-Za-z'’\- ]+)\b",
-        low,
-        flags=re.I,
-    ))
-    if not movement_hint:
-        return "", ""
-
     if anchor_date:
         m = re.search(r"\b(?:about\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+(?:ago|previously)\b", low)
         if m:
@@ -1441,6 +1309,10 @@ def derive_relative_arrival(snippet: str, doc_year: Optional[int], anchor_date: 
                 month += 12
                 year -= 1
             return f"{year:04d}-{month:02d}", "derived_from_doc"
+
+    m = re.search(r"\baged\s+about\s+(\d+)\s+years?\b", low)
+    if m and doc_year:
+        return str(doc_year - int(m.group(1))), "derived_from_doc"
 
     if "some months ago" in low and (anchor_date or doc_year):
         base = anchor_date or dt.date(doc_year, 12, 31)
@@ -1755,29 +1627,6 @@ def deterministic_places_for_page(ocr: str, name: str, doc_year: Optional[int]) 
             _maybe_add_place(found, -99999 + m2.start(), _transport_tail_strip(m2.group(2)), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
             special_hit = True
 
-    # Administrative memo/header places and weak destinations
-    for m2 in re.finditer(r"\brequests?\s+repatriation\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -88000 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-    for m2 in re.finditer(r"political\s+agent,?\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -87900 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-    for m2 in re.finditer(r"instead\s+of\s+sending\s+(?:him|her|them)\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -87800 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-    # Header recipient place such as BUSHIRE on forwarding memoranda
-    for m2 in re.finditer(r"\bBUSHIRE\b|\bBUSHEHR\b|\bBUSHIRE\.\b", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases) and re.search(r"\b(MEMORANDUM|forward\s+herewith|applying\s+for\s+the\s+grant)\b", ocr, flags=re.I):
-            ev = sentence_around(ocr, m2.start(), max_words=20)
-            _maybe_add_place(found, -87700 + m2.start(), "Bushire", "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
     if alias_alt:
         transport_pat = re.compile(rf"\b(?:{alias_alt})\b\s+([A-Za-z][A-Za-z'’\-/ ]{{2,40}})\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{{2,40}})(?=\s+(?:per|by)\s+s\.?s\.?|\s+voy\.?|\s*[\.,;]|\s*$)", re.I)
         for m2 in transport_pat.finditer(ocr):
@@ -1810,7 +1659,8 @@ def deterministic_places_for_page(ocr: str, name: str, doc_year: Optional[int]) 
             _maybe_add_place(found, -76000, header_loc, "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
             special_hit = True
 
-    # Continue into the generic rules too, so admin/special hits do not suppress page-local narrative places.
+    if special_hit:
+        return finalize(found)
 
     for pat, kind in PLACE_REGEXES:
         for m2 in pat.finditer(focus):
@@ -1832,13 +1682,6 @@ def deterministic_places_for_page(ocr: str, name: str, doc_year: Optional[int]) 
         ev = sentence_around(focus, m2.start(), max_words=35)
         _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
         _maybe_add_place(found, m2.start() + 1, m2.group(2), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-
-    for m2 in re.finditer(r"\bbeing\s+sent\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})", focus, flags=re.I):
-        ev = sentence_around(focus, m2.start(), max_words=35)
-        _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-    for m2 in re.finditer(r"\bwere\s+taken\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})", focus, flags=re.I):
-        ev = sentence_around(focus, m2.start(), max_words=35)
-        _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
 
     for pat in [
         r"\boriginally\s+lived\s+at\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})",
@@ -1868,7 +1711,7 @@ def deterministic_places_for_page(ocr: str, name: str, doc_year: Optional[int]) 
     ]:
         for m2 in re.finditer(pat, focus, flags=re.I):
             ev = sentence_around(focus, m2.start(), max_words=35)
-            order_kind = "assoc" if re.search(r"likes?\s+to\s+stay|\blive(?:\s+a\s+free\s+life)?\b|repatriation|onward\s+journey|passage", pat, flags=re.I) else "route"
+            order_kind = "assoc" if re.search(r"stay|live|repatriation|onward\s+journey|passage", pat, flags=re.I) else "route"
             _maybe_add_place(found, m2.start(), m2.group(1), order_kind, ev, doc_year, anchor_date, default_page_date, header_loc)
 
     if header_loc:
@@ -2389,22 +2232,6 @@ def process_page(current_ocr: str, page: int, filename: str, report_type: str, s
                 model_places = merge_places(broad_model, model_places)
 
         places = merge_places(det_places, model_places)
-        places = postprocess_places_for_page(current_ocr, page_type, places)
-
-        positive_count = 0
-        try:
-            positive_count = sum(1 for p in places if int(p.get("order", 0) or 0) > 0)
-        except Exception:
-            positive_count = 0
-        if allow_route and current_ocr != route_context and page_has_strong_place_cues(current_ocr) and positive_count < 3:
-            broad_det = deterministic_places_for_page(current_ocr, canonical_name, page_doc_year)
-            broad_model = []
-            try:
-                broad_model = model_places_for_name(current_ocr, canonical_name, stats)
-            except Exception as e:
-                logger.warning("Page %s place-broad-retry failed for %s: %s", page, canonical_name, e)
-            places = merge_places(places, merge_places(broad_det, broad_model))
-            places = postprocess_places_for_page(current_ocr, page_type, places)
 
         if not places:
             place_rows.append(blank_place_row(canonical_name, page))
@@ -2479,49 +2306,6 @@ def _place_page_incomplete(rows: List[Dict[str, Any]]) -> bool:
         return True
     return all(not normalize_ws(str(r.get("Place") or "")) for r in rows)
 
-
-def _page_rows_suspicious(current_ocr: str,
-                          detail_rows: List[Dict[str, Any]],
-                          place_rows: List[Dict[str, Any]]) -> bool:
-    nonblank_places = [r for r in place_rows if normalize_ws(str(r.get("Place") or ""))]
-    if any(is_suspicious_place_string(str(r.get("Place") or "")) for r in nonblank_places):
-        return True
-
-    page_type = classify_document_page(current_ocr)
-    pos_orders = []
-    by_name = defaultdict(list)
-    for r in nonblank_places:
-        by_name[normalize_name(str(r.get("Name") or ""))].append(r)
-        try:
-            pos_orders.append(int(r.get("Order") or 0))
-        except Exception:
-            pass
-
-    if page_type == "administrative_memo" and sum(1 for x in pos_orders if x > 0) >= 3:
-        return True
-
-    if page_type == "narrative_statement" and nonblank_places and sum(1 for x in pos_orders if x > 0) == 0 and page_has_strong_place_cues(current_ocr):
-        return True
-
-    if re.search(r"\bthe\s+following\s+refugee\s+slaves\s+from\b", current_ocr, flags=re.I):
-        for _, rows_for_name in by_name.items():
-            uniq = {normalize_place(str(r.get("Place") or "")) for r in rows_for_name if normalize_place(str(r.get("Place") or ""))}
-            if len(uniq) < 2:
-                return True
-
-    if re.search(r"\b(?:from\s+[A-Z][A-Za-z'’\- ]+\s+to\s+[A-Z][A-Za-z'’\- ]+|provided\s+with\s+a\s+deck\s+passage\s+to\s+[A-Z]|arrived\s+at\s+[A-Z][A-Za-z'’\- ]+\s+by\s+the\s+s\.?s\.?)\b", current_ocr, flags=re.I):
-        uniq_all = {normalize_place(str(r.get("Place") or "")) for r in nonblank_places if normalize_place(str(r.get("Place") or ""))}
-        if len(uniq_all) < 2:
-            return True
-
-    detail_names = {normalize_name(str(r.get("Name") or "")) for r in detail_rows if normalize_name(str(r.get("Name") or ""))}
-    names_with_places = {normalize_name(str(r.get("Name") or "")) for r in nonblank_places if normalize_name(str(r.get("Name") or ""))}
-    if detail_names and page_has_strong_place_cues(current_ocr) and not detail_names.issubset(names_with_places):
-        return True
-
-    return False
-
-
 def _read_existing_status_rows(path: str) -> List[Dict[str, Any]]:
     return _read_existing_csv_rows(path, STATUS_COLUMNS) if os.path.exists(path) else []
 
@@ -2534,16 +2318,11 @@ def _page_status_map(rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
     return out
 
 def should_process_page(page: int,
-                        current_ocr: str,
                         detail_by_page: Dict[int, List[Dict[str, Any]]],
                         place_by_page: Dict[int, List[Dict[str, Any]]],
                         status_by_page: Dict[int, Dict[str, Any]]) -> bool:
     drows = detail_by_page.get(page, [])
     prows = place_by_page.get(page, [])
-
-    if _page_rows_suspicious(current_ocr, drows, prows):
-        return True
-
     if prows and not _place_page_incomplete(prows):
         return False
 
@@ -2552,7 +2331,6 @@ def should_process_page(page: int,
         return False
 
     return True
-
 
 def _replace_page_rows(all_rows: List[Dict[str, Any]], page: int, new_rows: List[Dict[str, Any]], page_key: str) -> List[Dict[str, Any]]:
     kept = [r for r in all_rows if _page_int(r.get(page_key)) != page]
@@ -2653,8 +2431,7 @@ def main() -> None:
     pages_to_run: List[int] = []
     for fp in files:
         page = int(re.sub(r"\D", "", fp.stem) or 0)
-        current_ocr = page_texts.get(page) or fp.read_text(encoding="utf-8", errors="ignore")
-        if should_process_page(page, current_ocr, detail_by_page, place_by_page, status_by_page):
+        if should_process_page(page, detail_by_page, place_by_page, status_by_page):
             pages_to_run.append(page)
 
     logger.info("Pages selected for processing: %s", pages_to_run)
