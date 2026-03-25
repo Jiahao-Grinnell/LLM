@@ -1,422 +1,655 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Multipass OCR -> slave extraction pipeline for historical slavery/manumission pages.
+Model-first OCR extraction pipeline for historical slavery / manumission pages.
 
-Key design choices:
-- Keep Ollama as the backend.
-- Use MULTIPLE focused model calls per page instead of one overloaded prompt.
-- Recover explicit named slaves even when the model under-extracts via deterministic regex fallback.
-- Skip pages with no NAMED slaves.
-- Save CSV outputs incrementally after EVERY processed page.
-- Infer a single report type from the first page by default.
+Design:
+- Treat each .txt file as one standalone page.
+- Let the model do the substantive classification and extraction work.
+- Use deterministic code only to normalize, validate, deduplicate, and write outputs.
+- Write outputs incrementally after every page.
 
-Outputs
--------
-1) Detailed info.csv
-   Columns: Name, Page, Report Type, Crime Type, Whether abuse, Conflict Type, Trial, Amount paid
-
-2) name place.csv
-   Columns: Name, Page, Place, Order, Arrival Date, Date Confidence
-
-Status
-------
-run_status.csv includes per-page model call counts.
+Outputs:
+- Detailed info.csv
+- name place.csv
+- run_status.csv
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
-import datetime as dt
+import difflib
 import json
 import logging
 import os
 import pathlib
 import re
 import time
-from collections import defaultdict
-from difflib import SequenceMatcher
 import unicodedata
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from requests.exceptions import ConnectionError, ReadTimeout
 
-# ------------------- OLLAMA CONFIG -------------------
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/generate")
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:14b")
-REQUEST_TIMEOUT = (10, 600)
-MAX_CALL_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 15
+
+# ---------------------------------------------------------------------------
+# Ollama configuration
+# ---------------------------------------------------------------------------
+DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/generate")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "mistral-small3.1:latest")
 DEFAULT_NUM_PREDICT = int(os.environ.get("OLLAMA_NUM_PREDICT", "1200"))
 DEFAULT_NUM_CTX = os.environ.get("OLLAMA_NUM_CTX")
 DEFAULT_NUM_CTX = int(DEFAULT_NUM_CTX) if DEFAULT_NUM_CTX and DEFAULT_NUM_CTX.isdigit() else None
-
-_OLLAMA_SESSION = requests.Session()
-_OLLAMA_SESSION.headers.update({"Connection": "keep-alive"})
-
-_INDEX_LINE_PAT = re.compile(r"^\s*(?:\(?\d{1,4}\)?[\).]|[A-Z]\.|[ivxlcdm]{1,6}[\).])\s+", re.I)
-_INDEX_LIST_HINTS = (
-    "individual cases",
-    "correspondence re",
-    "manumission of slave",
-    "manumission of slaves",
-    "request by",
-    "do -",
-    "dv -",
-)
+REQUEST_TIMEOUT = (10, 600)
+MAX_CALL_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 10
 
 
-def looks_like_index_page(ocr: str) -> bool:
-    """Heuristic skip for list/index pages; leaves narrative pages unchanged."""
-    if not ocr:
-        return False
-    lines = [ln.strip() for ln in ocr.splitlines() if ln.strip()]
-    if len(lines) < 20:
-        return False
-    sample = lines[:120]
-    enum = sum(1 for ln in sample if _INDEX_LINE_PAT.match(ln))
-    short = sum(1 for ln in sample if len(ln) <= 120)
-    low = "\n".join(sample).lower()
-    hint_hits = sum(1 for h in _INDEX_LIST_HINTS if h in low)
-    short_ratio = short / max(1, len(sample))
-    return (enum >= 8 and short_ratio >= 0.55) or (hint_hits >= 2 and enum >= 5 and short_ratio >= 0.50)
+# ---------------------------------------------------------------------------
+# Output schema
+# ---------------------------------------------------------------------------
+DETAIL_COLUMNS = [
+    "Name",
+    "Page",
+    "Report Type",
+    "Crime Type",
+    "Whether abuse",
+    "Conflict Type",
+    "Trial",
+    "Amount paid",
+]
 
+PLACE_COLUMNS = [
+    "Name",
+    "Page",
+    "Place",
+    "Order",
+    "Arrival Date",
+    "Date Confidence",
+    "Time Info",
+]
 
-def looks_like_record_metadata_page(ocr: str) -> bool:
-    """Skip archive cover/about pages that mention cases but are not case pages."""
-    if not ocr:
-        return False
-    head = normalize_ws((ocr or "")[:2600]).lower()
-    hits = sum(
-        1 for pat in [
-            "this pdf was generated on",
-            "qatar digital library",
-            "the online record can be viewed at",
-            "holding institution",
-            "reference ior/",
-            "about this record",
-            "extent and format",
-            "copyright for document",
-            "open government licence",
-        ]
-        if pat in head
-    )
-    if hits >= 3:
-        return True
-    if "about this record" in head and "volume is comprised of correspondence" in head:
-        return True
-    return False
+STATUS_COLUMNS = [
+    "page",
+    "filename",
+    "status",
+    "named_people",
+    "detail_rows",
+    "place_rows",
+    "model_calls",
+    "repair_calls",
+    "elapsed_seconds",
+    "note",
+]
 
+REPORT_TYPES = {
+    "statement",
+    "transport/admin",
+    "correspondence",
+}
 
-# ------------------- PLACE NORMALIZATION -------------------
+LEGACY_REPORT_TYPE_MAP = {
+    "telegram": "correspondence",
+    "investigation/correspondence": "correspondence",
+    "official correspondence": "correspondence",
+}
+
+CRIME_TYPES = {
+    "kidnapping",
+    "sale",
+    "trafficking",
+    "illegal detention",
+    "forced transfer",
+    "debt-claim transfer",
+}
+
+CONFLICT_TYPES = {
+    "manumission dispute",
+    "ownership dispute",
+    "debt dispute",
+    "free-status dispute",
+    "forced-transfer dispute",
+    "repatriation dispute",
+    "kidnapping case",
+}
+
+TRIAL_TYPES = {
+    "manumission requested",
+    "manumission certificate requested",
+    "manumission recommended",
+    "manumission granted",
+    "free status confirmed",
+    "released",
+    "repatriation arranged",
+    "certificate delivered",
+}
+
+DATE_CONFIDENCE = {"explicit", "derived_from_doc", "unknown", ""}
+STATUS_VALUES = {
+    "ok",
+    "skip:index",
+    "skip:record_metadata",
+    "skip:bad_ocr",
+    "no_named_people",
+    "error",
+}
+
+NAME_STOPWORDS = {
+    "slave", "slaves", "woman", "man", "boy", "girl", "unknown", "unnamed",
+    "agency", "resident", "secretary", "captain", "major", "sheikh", "shaikh",
+    "political", "residency", "certificate", "statement", "memorandum", "telegram",
+    "master", "owner", "buyer", "seller", "agent", "office",
+}
+
+PLACE_STOPWORDS = {
+    "unknown", "unclear", "none", "nil", "there", "here", "this agency",
+    "the agency", "agency", "residency", "political agency", "residency agency",
+    "office", "record", "statement", "memorandum", "certificate", "arrival",
+}
+
 PLACE_MAP = {
-    # Gulf / Trucial Coast
     "shargah": "Sharjah",
-    "sharjah": "Sharjah",
-    "sharqah": "Sharjah",
     "sharjeh": "Sharjah",
-    "shargal": "Sharjah",
-    "abu dhabi": "Abu Dhabi",
-    "abu bakara": "Abu Bakara",
-    "abu baqarah": "Abu Bakara",
-    "abu bakaran": "Abu Bakara",
-    "murair": "Murair",
-    "merai": "Murair",
-    "sur": "Sur",
-    "hemriyah": "Hamriyah",
-    "hamriyah": "Hamriyah",
-    "shindagha": "Shindagha",
-    "shamdaghah": "Shindagha",
-    "ras ul khaimah": "Ras al Khaimah",
-    "ras ul khaima": "Ras al Khaimah",
-    "ras al khaimah": "Ras al Khaimah",
-    "as al khaimah": "Ras al Khaimah",
-    "as ul khaimah": "Ras al Khaimah",
-    "rasul khaimah": "Ras al Khaimah",
-    "umm al quwain": "Umm al Quwain",
-    "umm ul quwain": "Umm al Quwain",
-    "umm-ul-qaiwain": "Umm al Quwain",
-    "umm-ul-quwain": "Umm al Quwain",
-    "umm ul qaiwain": "Umm al Quwain",
-    "umm al qaiwain": "Umm al Quwain",
-    "umm el quwain": "Umm al Quwain",
-    "jumairah": "Jumeirah",
-    "jumair": "Jumeirah",
-    "jumeirah": "Jumeirah",
-    "ajmar": "Ajman",
-    "aiman": "Ajman",
-    "ajman": "Ajman",
-    "debai": "Dubai",
+    "sharjah": "Sharjah",
     "dibai": "Dubai",
-    "dobai": "Dubai",
-    "dohai": "Dubai",
-    "ebai": "Dubai",
+    "debai": "Dubai",
     "dubai": "Dubai",
-    "muscat": "Muscat",
-    "mascat": "Muscat",
-    "museat": "Muscat",
     "bahrein": "Bahrain",
     "bahrain": "Bahrain",
-    "muharraq": "Muharraq",
-    "henjam": "Henjam",
-    "honjam": "Henjam",
-    "bandar abbas": "Bandar Abbas",
-    "lingah": "Lingah",
     "bushire": "Bushehr",
-    "bushehr": "Bushehr",
     "busheir": "Bushehr",
-
-    # Oman / inland
-    "batinah": "Batinah",
-    "batinah coast": "Batinah Coast",
-    "khazrah of batinah": "Khazrah of Batinah",
-    "khazrah of batina": "Khazrah of Batinah",
-    "oman coast": "Oman Coast",
-    "oman": "Oman",
-    "badiya in oman": "Badiya, Oman",
-    "amahn": "Oman",
-    "amahan": "Oman",
-    "amanan": "Oman",
-    "jask": "Jask",
-    "jiddeh": "Jeddah",
-    "jiddah": "Jeddah",
-    "mecca": "Mecca",
-    "qatar": "Qatar",
-    "eastern rufa": "Eastern Rufa",
-    "eastern rufa'": "Eastern Rufa",
-
-    # Persia / Baluchistan / East Africa
-    "persia": "Persia",
+    "bushehr": "Bushehr",
     "mekran": "Mekran",
     "mokran": "Mekran",
-    "minab": "Minab",
-    "mirab": "Minab",
-    "kuhru": "Kuhru",
-    "kahru": "Kuhru",
-    "gibrik": "Gibrik",
-    "kuhistak": "Kuhistak",
-    "seri": "Seri",
-    "khan": "Khan",
-    "rudbar": "Rudbar",
-    "suza": "Suza",
-    "bint": "Bint",
-    "boshakird": "Boshakird",
-    "boashakird": "Boshakird",
-    "bashakird": "Boshakird",
-    "bishakird": "Boshakird",
+    "henjam": "Henjam",
+    "honjam": "Henjam",
+    "ras ul khaimah": "Ras al Khaimah",
+    "ras al khaimah": "Ras al Khaimah",
+    "umm al quwain": "Umm al Quwain",
+    "umm ul quwain": "Umm al Quwain",
+    "muscat": "Muscat",
+    "mascat": "Muscat",
     "zanzibar": "Zanzibar",
-    "selali": "Selali",
-    "midi": "Midi",
-    "abisinia": "Abyssinia",
     "abyssinia": "Abyssinia",
-    "nejd": "Nejd",
-    "naburi": "Naburi",
-}
-NON_GEO_PLACEHOLDERS = {
-    "unknown", "unclear", "n/a", "na", "none", "nil", "there", "here",
-    "residency", "political resident", "resident", "agency", "residency agency",
-    "at sea", "diving grounds", "diving place", "this agency", "the agency", "africa",
+    "abisinia": "Abyssinia",
 }
 
-MAX_PLACE_WORDS = 6
-BAD_PLACE_TOKEN_PAT = re.compile(
-    r"\b(and|to|from|therefore|told|landed|kept|captured|bought|sold|sent|took|arrived|reached|"
-    r"earn|livelihood|godown|days|later|recorded|aged|statement|made)\b",
-    re.I,
-)
 MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
-}
-WORD_NUM = {
-    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
-    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
-    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
 }
 
-ROLE_TITLE_PAT = re.compile(
-    r"\b(residency agent|political resident|treasury accounts officer|chief|shaikh|sheikh|major|"
-    r"captain|lieutenant|lt\.?|mr\.?|mrs\.?|miss|nakhuda)\b",
-    re.I,
-)
+ISO_DATE_PAT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-DETAIL_COLUMNS = [
-    "Name", "Page", "Report Type", "Crime Type", "Whether abuse", "Conflict Type", "Trial", "Amount paid"
-]
-PLACE_COLUMNS = ["Name", "Page", "Place", "Order", "Arrival Date", "Date Confidence", "Time Info"]
-STATUS_COLUMNS = [
-    "page", "filename", "status", "named_slaves", "detail_rows", "place_rows",
-    "model_calls", "extract_calls", "repair_calls", "elapsed_seconds", "note"
-]
 
-# ------------------- PROMPTS -------------------
-NAME_PASS_PROMPT = """You are extracting ONLY NAMED enslaved persons from one OCR page.
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+PAGE_CLASSIFY_PROMPT = """You are reading ONE OCR page from a historical slavery / manumission archive.
+
+Your task is to decide whether this page should be extracted, and if so infer the page-level report type.
 
 Return JSON only:
-{{
-  "named_slaves": [
-    {{"name": string, "evidence": string}}
-  ]
-}}
+{
+  "should_extract": true,
+  "skip_reason": null,
+  "report_type": "statement",
+  "evidence": "..."
+}
 
-Rules:
-- Include ONLY people with a real personal name.
-- Omit unnamed people entirely.
-- Include a person only if the page explicitly states or strongly implies they are enslaved / a slave / kidnapped into slavery / sold / bought / manumitted / re-enslaved.
-- Strong cues include phrases like:
-  * a slave named X
-  * statement made by X in a slave/manumission case
-  * statement of slave X
-  * slave girl X / slave boy X
-  * grant X a manumission certificate
-  * refugee slaves namely X, Y, Z
-  * Slave No. 1 = X / Slave No. 2 - Y
-- Exclude masters, buyers, heirs, rulers, sheikhs, officials, witnesses.
-- Do NOT include a name merely because the page says "sold to X" or "a woman/man named X" unless X is clearly the enslaved/manumission subject.
-- evidence must be a short quote <=25 words.
-- Output JSON only, no markdown.
+Allowed skip_reason values:
+- null
+- index
+- record_metadata
+- bad_ocr
 
-OCR TEXT:
-<<<{ocr}>>>
-"""
+Allowed report_type values:
+- statement
+- transport/admin
+- correspondence
 
-NAME_RECALL_PROMPT = """Extract EVERY NAMED enslaved person from this OCR page.
+Definitions:
+- statement: recorded testimony, declaration, or first-person account
+- transport/admin: logistics, expenses, passage, repatriation arrangements, maintenance, reimbursement, certificate handling, or administrative movement
+- correspondence: any official letter, telegram, memo, recommendation, forwarding note, or investigative office communication
 
-This is a recall-focused second pass.
-Look especially for FULL names with connectors like bin / bint / al and lineage forms like daughter of / son of.
-Look especially for:
-- "a slave ... named X"
-- "grant X a manumission certificate"
-- "statement made by X" when the page is clearly about the enslavement/manumission of X
-- "statement of slave X"
-- "slave X who sought refuge"
-- "refugee slaves namely X, Y, Z"
-- numbered lists such as "Slave No. 1 = X" or "(1) X"
-- lists introduced by "for delivery to:" or "the following refugee slaves"
+Guidelines:
+- Choose statement when the page is mainly a recorded personal account or formal declaration by a subject or witness.
+- Choose transport/admin when the page is mainly about passage, repatriation, transport, maintenance, reimbursement, delivery, routing, or similar administrative handling.
+- Choose correspondence for official communication pages of all other kinds, including letters, telegrams, memoranda, investigative discussion, recommendations, and forwarding notes.
 
-Return JSON only:
-{{
-  "named_slaves": [
-    {{"name": string, "evidence": string}}
-  ]
-}}
+Skip only when the page is clearly one of these:
+- index or list page
+- archive metadata / cover / about-this-record page
+- OCR too damaged to extract reliably
 
 Important:
-- Include ONLY people with real names.
-- Do NOT include unnamed slaves.
-- Do NOT include owners or officials.
-- Do NOT include buyers/sellers who appear only in phrases like "sold to X".
-
-OCR TEXT:
-<<<{ocr}>>>
-"""
-
-PLACE_PASS_PROMPT = """You are extracting the PAGE-LOCAL places for one named slave from one OCR page.
-
-Target slave name: {name}
-
-Return JSON only:
-{{
-  "name": "{name}",
-  "places": [
-    {{
-      "place": string,
-      "order": integer,
-      "arrival_date": string|null,
-      "date_confidence": "explicit"|"derived_from_doc"|"unknown",
-      "time_text": string|null,
-      "evidence": string
-    }}
-  ]
-}}
-
-Rules:
-- Preserve the FULL target name exactly as given.
-- Use ONLY this page. Do not infer from neighboring pages or earlier/later case pages.
-- Extract every real named place explicitly linked to {name} on this page.
-- order = 1,2,3,... ONLY for a clear personal movement sequence or an explicit transport sequence on this page.
-- order = 0 for weak admin/naval/context/intended places, including memo routing, office/header places, maintenance locations, certificate-delivery locations, desired future residence, requested repatriation destination, and similar non-life-route context.
-- Shared-list pages matter: if one sentence governs several listed names, apply the shared places to this target name too.
-- Transport/admin pages matter: capture page-local places from wording like from X to Y, passage to Y, repatriation to Y, arrived at Y, refugee slaves from X, taken to Y, handed to Y, maintaining at X.
-- Do NOT turn ship names, office labels, ticket text, or naval rendezvous locations into personal route steps.
-- arrival_date should be ISO only when a date is explicitly tied to the movement/place on this page. Do NOT infer dates from age text like "aged about 20 years" or vague background phrases alone.
-- time_text should keep a short phrase like "arrived at Bahrain by the S.S. Bandra", "provided with a deck passage to Bombay", or "likes to stay at Ras al Khaimah".
-- evidence must be <=25 words.
-- Do not invent places.
+- Use ONLY this page.
+- Do not decide skip_reason merely because the page is short or administrative.
+- Administrative cover letters that still name manumission subjects should still be extracted.
+- evidence must be a short quote or phrase from the page, max 25 words.
 - Output JSON only.
 
 OCR TEXT:
 <<<{ocr}>>>
 """
 
-PLACE_RECALL_PROMPT = """Extract any missed PAGE-LOCAL places for the named slave below.
-
-Target slave name: {name}
+NAME_PASS_PROMPT = """You are extracting ALL named enslaved/manumission subjects from ONE OCR page.
 
 Return JSON only:
-{{
-  "name": "{name}",
-  "places": [
-    {{
-      "place": string,
-      "order": integer,
-      "arrival_date": string|null,
-      "date_confidence": "explicit"|"derived_from_doc"|"unknown",
-      "time_text": string|null,
-      "evidence": string
-    }}
+{
+  "named_people": [
+    {"name": string, "evidence": string}
   ]
-}}
+}
 
-Focus on places often missed in OCR pages:
-- shared-list route pages such as "the following refugee slaves from X arrived at Y"
-- transport/admin pages such as "Muscat to Bombay per s.s. ...", "repatriation to Zanzibar", "deck passage to Bombay", "taken to Muscat"
-- intended / requested places like "likes to stay at Ras al Khaimah" or "allowed to live in Hinjam" (use order=0 unless the page clearly states actual movement)
-- page header/admin locations when the text says this Agency / Residency Agency and the location is explicit in the header (use order=0 unless the page clearly states actual arrival)
-- first-person route wording such as kidnapped from X, brought me to Y, sold me at Z, escaped to W, sent me to V
+Task:
+Find every named person on this page who is themselves an enslaved subject, refugee slave, fugitive slave, manumission applicant, certificate recipient, person recommended for manumission, or person whose statement/case/paper is being handled on this page.
 
-Preserve full names and output JSON only.
+Who to INCLUDE:
+- people who are themselves the enslaved subject, slave, refugee slave, fugitive slave, manumission applicant, certificate recipient, or grouped subject on this page
+- people named in shared lists such as "the following refugee slaves", "for delivery to:", numbered subject lists, grouped recommendation pages, grouped certificate pages, or grouped forwarding pages
+- people on correspondence pages when the page is clearly about granting, recommending, delivering, or forwarding their manumission-related papers
+- a child, mother, son, daughter, or grouped family member when the page explicitly gives that person a name and clearly treats them as part of the subject group
+
+Who to EXCLUDE:
+- owners, masters, buyers, sellers, captains, rulers, sheikhs, secretaries, agents, clerks, witnesses, correspondents, office staff, and other non-subject people
+- a person mentioned only because the page says "sold to X", "sold me to X", "bought by Y", "belonging to Z", "letter from Z", "statement recorded by A", or similar non-subject roles
+- any free-born person or any person explicitly described as not being a slave
+
+Critical disambiguation:
+- if a statement says the subject was sold TO someone, that buyer is not a subject
+- if the page names several owners or masters in a transfer chain, return only the enslaved/manumission subject, not the owners
+- do not return a name unless the page supports that this person is part of the enslaved/manumission subject group
+
+How to read the page:
+- scan the full page, not just the first paragraph
+- look in prose, headings, numbered lines, parenthesized lists, certificate-delivery lines, forwarding lines, and signatures
+- if one sentence governs multiple listed names, include every named subject in the list
+- if the page is a short office letter but clearly names one or more people whose certificate or case is being handled, include them
+- if a name is partly noisy from OCR, return the best page-supported version only; do not invent missing text
+
+Name formatting rules:
+- preserve the fullest page-supported personal name string
+- keep lineage and kinship connectors such as bin, bint, daughter of, son of, Abu, Umm when present
+- do not return titles or office descriptions as names
+- include only real named people, not unnamed descriptions like "slave girl", "a woman", "three slaves" with no names
+
+Evidence rules:
+- evidence must be a short quote or phrase from the page, max 25 words
+- evidence should support why this person is a subject rather than merely proving the name exists
+
+Output JSON only.
 
 OCR TEXT:
 <<<{ocr}>>>
 """
 
-META_PASS_PROMPT = """You are extracting case metadata for one NAMED slave from one OCR page.
-
-Target slave name: {name}
-Report Type (fixed): {report_type}
-Page: {page}
+NAME_RECALL_PROMPT = """Do a second, recall-focused pass over this same OCR page and return ONLY named enslaved/manumission subjects that might have been missed.
 
 Return JSON only:
-{{
+{
+  "named_people": [
+    {"name": string, "evidence": string}
+  ]
+}
+
+Look especially for:
+- names after "the following refugee slaves"
+- names after "for delivery to"
+- names in numbered or parenthesized lists
+- names in certificate recommendation / delivery pages
+- names in grouped correspondence where one sentence applies to several people
+- names with lineage forms such as "daughter of" or "son of"
+- names appearing after "statement of", "statement made by", "certificate to", "grant certificate to", or "recommend certificate for"
+
+Still exclude owners, officials, buyers/sellers, and any free-born or non-slave person.
+If a page contains a transfer chain like "sold to X" or "bought by Y", those names are not subjects.
+Output JSON only.
+
+OCR TEXT:
+<<<{ocr}>>>
+"""
+
+
+NAME_FILTER_PROMPT = """You are filtering candidate names from one extraction stage for ONE OCR page.
+
+You are given:
+- the OCR text for one page
+- a candidate list produced by a single extraction pass
+
+Return JSON only:
+{
+  "named_people": [
+    {"name": string, "evidence": string}
+  ]
+}
+
+Task:
+Keep ONLY candidate names that are clearly named enslaved subjects, refugee slaves, fugitive slaves, manumission applicants, certificate recipients, or clearly named members of the same enslaved/manumission subject group on this page.
+
+Critical rules:
+- Choose ONLY from the provided candidate list. Do not invent new names.
+- Exclude owners, masters, buyers, sellers, rulers, sheikhs, captains, correspondents, writers, signatories, witnesses, office staff, and other non-subject people.
+- If the page says the subject was sold TO someone, bought by someone, belonged to someone, or was recorded by someone, that other person is not a subject.
+- If a short telegram or administrative page explicitly says something like "slave ... named X", "named X ... slave", or "X requests repatriation", keep that person.
+- If uncertain, prefer precision: exclude the doubtful name.
+
+Evidence rules:
+- evidence must be a short quote or phrase from the page, max 25 words
+- evidence should support why this person is a subject rather than merely proving the name exists
+
+Stage: {stage}
+
+CANDIDATE NAMES JSON:
+<<<{candidate_names_json}>>>
+
+OCR TEXT:
+<<<{ocr}>>>
+"""
+
+NAME_VERIFY_PROMPT = """You are doing FINAL name adjudication for ONE OCR page.
+
+You are given:
+- the OCR text for one page
+- a merged candidate list produced by earlier extraction passes
+
+Return JSON only:
+{
+  "named_people": [
+    {"name": string, "evidence": string}
+  ]
+}
+
+Task:
+From the candidate list, return the COMPLETE final list of named people who are themselves enslaved subjects, refugee slaves, fugitive slaves, manumission applicants, certificate recipients, or clearly named members of the same subject group on this page.
+
+Critical rules:
+- Choose ONLY from the provided candidate list. Do not invent new names.
+- Return the complete final list, not just changes.
+- Keep a relative only when the page clearly treats that named relative as part of the enslaved/manumission subject group.
+- Exclude owners, masters, buyers, sellers, rulers, sheikhs, captains, correspondents, writers, signatories, witnesses, office staff, and other non-subject people.
+- If the page says the subject was sold TO someone, bought by someone, belonged to someone, or was recorded by someone, that other person is not a subject.
+- If a short telegram or administrative page explicitly says something like "slave ... named X", "named X ... slave", or "X requests repatriation", keep that person.
+- If uncertain, prefer precision: exclude the doubtful name.
+
+Evidence rules:
+- evidence must be a short quote or phrase from the page, max 25 words
+- evidence should support why this person is a subject rather than merely proving the name exists
+
+CANDIDATE NAMES JSON:
+<<<{candidate_names_json}>>>
+
+OCR TEXT:
+<<<{ocr}>>>
+"""
+
+META_PASS_PROMPT = """You are extracting person-specific metadata for ONE named enslaved/manumission subject from ONE OCR page.
+
+Target person: {name}
+Page number: {page}
+Report Type for this page: {report_type}
+
+Report type definitions:
+- statement: recorded testimony, declaration, or first-person account
+- transport/admin: logistics, expenses, passage, repatriation arrangements, maintenance, reimbursement, certificate handling, or administrative movement
+- correspondence: any official letter, telegram, memo, recommendation, forwarding note, or investigative office communication
+
+Return JSON only:
+{
   "name": "{name}",
   "page": {page},
   "report_type": "{report_type}",
-  "crime_type": string|null,
-  "whether_abuse": "yes"|"no"|"" ,
-  "conflict_type": string|null,
-  "trial": string|null,
-  "amount_paid": string|null,
-  "evidence": string|null
-}}
+  "crime_type": null,
+  "whether_abuse": "",
+  "conflict_type": null,
+  "trial": null,
+  "amount_paid": null,
+  "evidence": {
+    "crime_type": null,
+    "whether_abuse": null,
+    "conflict_type": null,
+    "trial": null,
+    "amount_paid": null
+  }
+}
+
+Allowed values:
+- crime_type: kidnapping | sale | trafficking | illegal detention | forced transfer | debt-claim transfer | null
+- whether_abuse: yes | no | ""
+- conflict_type: manumission dispute | ownership dispute | debt dispute | free-status dispute | forced-transfer dispute | repatriation dispute | kidnapping case | null
+- trial: manumission requested | manumission certificate requested | manumission recommended | manumission granted | free status confirmed | released | repatriation arranged | certificate delivered | null
+- amount_paid: short literal amount string from the page, otherwise null
 
 Rules:
-- report_type must equal the fixed value above.
-- crime_type = type of crime attached against that slave (kidnapping, sale, illegal detention, trafficking, etc.) only if supported.
-- whether_abuse: yes if explicitly abused; no if explicitly states no abuse; otherwise empty string.
-- conflict_type: conflict involved in the case only if supported.
-- trial: formal verdict / outcome for that person only if supported.
-- amount_paid: amount paid for manumission or release only if supported.
-- Leave unsupported text fields null.
+- Use ONLY this page and ONLY the target person.
+- Do not copy facts from another person on the same page unless the wording clearly applies to the target person too.
+- Leave unsupported fields blank/null rather than guessing.
+- whether_abuse = yes only when the page explicitly states beating, cruel treatment, confinement, violence, flogging, starvation, forced prostitution, overwork, threats, prison, chains, or equivalent abuse.
+- whether_abuse = no only when the page explicitly says there was no abuse or no ill-treatment.
+- crime_type should reflect what happened to the target person on this page.
+- conflict_type should reflect the dispute framing of this page, not the target's entire life story.
+- trial should reflect the procedural status or outcome on this page only.
+- amount_paid should be filled only when the page explicitly gives a payment amount tied to the target person's case handling, maintenance, passage, release, or repatriation.
+- each non-null field must have a short supporting evidence quote, max 25 words.
 - Output JSON only.
 
 OCR TEXT:
 <<<{ocr}>>>
 """
 
-JSON_REPAIR_PROMPT = """Fix the following so it is valid JSON only. Do not add new facts.
-Target top-level shape:
+PLACE_PASS_PROMPT = """You are extracting PAGE-LOCAL places for ONE named enslaved/manumission subject from ONE OCR page.
+
+Target person: {name}
+
+Return JSON only:
+{
+  "name": "{name}",
+  "places": [
+    {
+      "place": string,
+      "order": integer,
+      "arrival_date": string | null,
+      "date_confidence": "explicit" | "derived_from_doc" | "unknown",
+      "time_text": string | null,
+      "evidence": string
+    }
+  ]
+}
+
+This is a page-local extraction task.
+Use ONLY this page.
+
+What to extract:
+- every real named place explicitly linked to the target person on this page
+- birthplace / native place / residence / origin
+- kidnapped from / captured from / brought to / taken to / sold at / sent to / arrived at / reached / escaped to / took refuge at
+- actual origin, actual movement/transfer/arrival/refuge/presence, and any clearly arranged or formally proposed next destination for the target person on this page
+
+Arrival date task:
+For EACH place row, try your best to recover the date tied to the target person's connection to that place on this page.
+- use arrival_date only when the page explicitly states a date for that place/movement/presence OR when the date is clearly derived from the page date for that handling event
+- if the page is a statement recorded on a known date and the target person is explicitly at that place on that page, you may use the statement date with date_confidence="derived_from_doc"
+- if the page is a certificate, delivery, recommendation, forwarding, repatriation, release, or handling page and a place is clearly the handling/delivery place for the target person, you may use the page date with date_confidence="derived_from_doc"
+- if the page gives only partial timing such as "May 1931", "five years ago", "some months ago", or "on arrival", leave arrival_date null and put that wording in time_text
+- never invent a full date when the page only gives month/year or vague relative time
+
+Order rules:
+- use order = 1,2,3,... for any place that the page clearly shows as an actual life-route step, completed movement, present location, source location, or arrival/destination in a forwarding chain
+- if the page gives a confident source→destination or arrival statement such as "from X", "forwarded ... arriving Y", "reached Y", "arrived Y", "escaped to Y", or "went to Y", do NOT use order = 0 for those places
+- use order = 0 only when the place is relevant but the target person's arrival/presence there is not sufficiently certain, including:
+  * office or agency location not clearly linked as the subject's own location
+  * memo forwarding point only
+  * certificate delivery point only
+  * requested future residence
+  * intended destination not clearly completed
+  * repatriation target not clearly completed
+  * administrative handling location only
+
+Shared-list rules:
+- if a sentence or paragraph governs several listed names, and the target person is one of them, apply the shared place to the target person too
+- grouped recommendation or certificate pages can still yield valid order=0 places
+- if a grouped page names several people and one handling location/date applies to all of them, return that place/date for each applicable target person
+
+What NOT to extract:
+- ship names
+- office titles instead of places
+- generic words like agency, residency, office, there, here, sea
+- places that belong only to a correspondent or recipient and are not clearly linked to the target person
+
+Evidence rules:
+- every place needs a short supporting quote or phrase, max 25 words
+- every non-null arrival_date should be supported by evidence tied to that place
+
+Output JSON only.
+
+OCR TEXT:
+<<<{ocr}>>>
+"""
+
+PLACE_RECALL_PROMPT = """Do a second, recall-focused pass for PAGE-LOCAL places for the same target person.
+
+Target person: {name}
+
+Return JSON only:
+{
+  "name": "{name}",
+  "places": [
+    {
+      "place": string,
+      "order": integer,
+      "arrival_date": string | null,
+      "date_confidence": "explicit" | "derived_from_doc" | "unknown",
+      "time_text": string | null,
+      "evidence": string
+    }
+  ]
+}
+
+Look especially for places often missed:
+- birthplace / native place wording
+- grouped subject pages where one shared place applies to multiple listed names
+- certificate delivery locations
+- movement chains like from X to Y and thence to Z
+- formal next-step movements such as sent to, sending him to, forwarded to, for delivery to, or repatriation to
+- administrative pages where a real forwarding route may exist, e.g. source place plus destination/arrival place
+- use order=0 only when the page does not clearly support route membership or target linkage
+- dates attached to the place, the handling event, the delivery event, the statement date, or the page date
+
+If a place has no support for a full date, leave arrival_date null and preserve partial timing in time_text.
+Output JSON only.
+
+OCR TEXT:
+<<<{ocr}>>>
+"""
+
+PLACE_VERIFY_PROMPT = """You are doing FINAL verification and canonicalization of page-local places for ONE named enslaved/manumission subject.
+
+Target person: {name}
+Page number: {page}
+Candidate place rows already extracted (may contain mistakes, duplicates, or inconsistent ordering):
+{candidate_places_json}
+
+Return JSON only:
+{
+  "name": "{name}",
+  "places": [
+    {
+      "place": string,
+      "order": integer,
+      "arrival_date": string | null,
+      "date_confidence": "explicit" | "derived_from_doc" | "unknown",
+      "time_text": string | null,
+      "evidence": string
+    }
+  ]
+}
+
+Task:
+Produce the COMPLETE FINAL place list for this target person on this page.
+Use the OCR text plus the candidate rows. You may drop wrong places, merge duplicates, normalize OCR variants to the same real place, fix ordering, and fix date/time fields.
+Do not add speculative places.
+
+Core rules:
+- Extract only places that truly belong to the target person's own page-local route, presence, origin, refuge, transfer, arrival, or formally arranged next movement on this page.
+- Relative or owner places do not belong to the target unless the page clearly says the target person was also there.
+- Ship names are never places.
+- "house of X", "household of X", and similar household descriptions are not standalone places unless they clearly name a real settlement/place.
+- Generic office words like office, here, there are not places.
+- Agency / Political Agency may be kept when the page clearly says the target person is there or took refuge there.
+
+Order rules:
+- Use order = 1,2,3,... for the target person's ordered route on this page.
+- A place may have positive order even if arrival_date is blank, when the page clearly frames it as the next formal movement step.
+- This includes wording such as sent to, sending him to, to be sent to, forwarded to, for delivery to, repatriation to, arranged with ... for, or equivalent formal next-step movement.
+- Use order = 0 only for relevant places that are background-only, weakly linked, generic administration, or not clearly part of the route sequence.
+- Make the final positive-order sequence internally consistent with the page's time wording and evidence.
+
+Date/time rules:
+- Keep arrival_date only when explicitly stated or clearly derivable from the page date for that place-event.
+- If a place is a formal next step but not yet completed, it may still have positive order with blank arrival_date.
+- Put proposal or arrangement wording into time_text rather than forcing order = 0.
+- Ensure order, arrival_date, and time_text do not contradict each other.
+
+Duplicate/canonicalization rules:
+- Each final place should appear only once.
+- If two candidates are OCR variants of the same place, keep one canonical place string.
+- Return the final complete list, not only corrections.
+
+Evidence rules:
+- Every place needs a short supporting quote or phrase, max 25 words.
+- Evidence should support both the place and why it belongs in that position.
+
+Output JSON only.
+
+OCR TEXT:
+<<<{ocr}>>>
+"""
+
+PLACE_DATE_ENRICH_PROMPT = """You already extracted page-local places for ONE named enslaved/manumission subject from ONE OCR page.
+
+Target person: {name}
+
+Current places:
+{places_json}
+
+Your task:
+Keep the same places and try to improve ONLY the date-related fields for each place.
+
+Return JSON only:
+{
+  "name": "{name}",
+  "places": [
+    {
+      "place": string,
+      "order": integer,
+      "arrival_date": string | null,
+      "date_confidence": "explicit" | "derived_from_doc" | "unknown",
+      "time_text": string | null,
+      "evidence": string
+    }
+  ]
+}
+
+Rules:
+- Keep the same place list; do not add new places here.
+- Try your best to find a date for each place using ONLY this page.
+- Use explicit only when the date is directly stated for that place or event.
+- Use derived_from_doc when the page date clearly dates that handling/presence/delivery/recommendation/statement event for that place.
+- If the page only gives partial timing such as month-year or vague relative time, leave arrival_date null and put that timing in time_text.
+- Do not invent full dates.
+- Keep evidence short, max 25 words.
+
+OCR TEXT:
+<<<{ocr}>>>
+"""
+
+JSON_REPAIR_PROMPT = """Fix the following so it is valid JSON only.
+Do not add new facts.
+
+Required top-level shape:
 {schema}
 
 TEXT TO FIX:
@@ -424,397 +657,153 @@ TEXT TO FIX:
 """
 
 
-# ------------------- UTILITIES -------------------
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+@dataclass
+class CallStats:
+    model_calls: int = 0
+    repair_calls: int = 0
 
-def normalize_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
+
+@dataclass
+class PageDecision:
+    should_extract: bool
+    skip_reason: Optional[str]
+    report_type: str
+    evidence: str = ""
 
 
-def _strip_accents(s: str) -> str:
-    if not s:
+# ---------------------------------------------------------------------------
+# Generic utilities
+# ---------------------------------------------------------------------------
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def strip_accents(text: str) -> str:
+    if not text:
         return ""
-    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+    return "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
 
 
-def normalize_name(raw: str) -> str:
-    if not raw:
+def clean_ocr(text: str) -> str:
+    if not text:
         return ""
-    s = re.split(r"\|\s*role\s*:", raw, flags=re.I)[0]
-    s = _strip_accents(s)
-    s = normalize_ws(s)
-    s = s.strip(" ,.;:[]{}\"'")
-    s = re.sub(r"^(?:Mst|Mrs|Miss|Mr)\.?\s+", "", s, flags=re.I)
-    s = re.sub(r"^(?:the\s+)?slave\s+", "", s, flags=re.I)
-    s = re.sub(r"\bslave\s*no\.?\s*\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\bslave\s*no\.?\b.*$", "", s, flags=re.I)
-    s = re.sub(r"\b(ibn)\b", "bin", s, flags=re.I)
-    s = re.sub(r"\b(bint)\b", "bint", s, flags=re.I)
-    s = re.sub(r"\b(al|el|ul)\b", lambda m: m.group(1).lower(), s, flags=re.I)
-    s = re.sub(r"\b(bin)\b", "bin", s, flags=re.I)
-    s = re.sub(r"\b(abu)\b", "Abu", s, flags=re.I)
-    s = re.sub(r"\b(umm)\b", "Umm", s, flags=re.I)
-    s = re.sub(r"\b(?:aged\s+about|aged|small\s+son|eldest\s+son|recorded\s+on)\b.*$", "", s, flags=re.I)
-    s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
-    tokens = []
-    for tok in s.split():
-        low = tok.lower()
-        if low in {"bin", "bint", "al", "el", "ul", "ibn"}:
-            tokens.append("bin" if low == "ibn" else low)
-        elif low in {"abu", "umm"}:
-            tokens.append(low.title())
-        else:
-            tokens.append(tok[:1].upper() + tok[1:])
-    return normalize_ws(" ".join(tokens))
+    text = text.replace("\ufeff", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    cleaned: List[str] = []
+    for line in lines:
+        line = re.sub(r"[\t ]+", " ", line).strip()
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
-def _name_skeleton(name: str) -> str:
-    n = normalize_name(name).lower()
-    n = _strip_accents(n)
-    toks = []
-    for tok in re.findall(r"[a-z']+", n):
-        if tok in {"bin", "bint", "daughter", "son", "of", "al", "el", "ul", "abu", "umm"}:
-            toks.append(tok)
-            continue
-        tok = tok.replace("v", "f").replace("p", "f").replace("ph", "f")
-        tok = tok.replace("oo", "u").replace("ee", "i")
-        toks.append(tok)
-    return " ".join(toks)
+def page_number_from_path(path: pathlib.Path) -> int:
+    digits = re.sub(r"\D", "", path.stem)
+    return int(digits) if digits else 0
 
 
-def names_maybe_same_person(a: str, b: str) -> bool:
-    a_n = normalize_name(a)
-    b_n = normalize_name(b)
-    if not a_n or not b_n:
-        return False
-    if a_n.lower() == b_n.lower():
-        return True
-
-    a_toks = [t.lower() for t in a_n.split()]
-    b_toks = [t.lower() for t in b_n.split()]
-    short, long = (a_toks, b_toks) if len(a_toks) <= len(b_toks) else (b_toks, a_toks)
-    if long[:len(short)] == short and len(short) >= 1:
-        return True
-    if a_toks and b_toks and a_toks[0] == b_toks[0] and (len(a_toks) == 1 or len(b_toks) == 1):
-        return True
-
-    a_core = [t for t in a_toks if t not in {"bin", "bint", "daughter", "son", "of", "al", "el", "ul"}]
-    b_core = [t for t in b_toks if t not in {"bin", "bint", "daughter", "son", "of", "al", "el", "ul"}]
-    if len(a_core) == len(b_core) and a_core:
-        sims = [SequenceMatcher(None, x, y).ratio() for x, y in zip(a_core, b_core)]
-        if sum(sims) / len(sims) >= 0.83:
-            return True
-    return _name_skeleton(a_n) == _name_skeleton(b_n)
+def write_csv(path: pathlib.Path, rows: List[Dict[str, Any]], columns: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({col: row.get(col, "") for col in columns})
+    tmp.replace(path)
 
 
-def choose_preferred_name(*names: str) -> str:
-    candidates = [normalize_name(n) for n in names if normalize_name(n)]
-    if not candidates:
-        return ""
-    def score(n: str) -> tuple:
-        toks = n.split()
-        low = n.lower()
-        lineage_bonus = 1 if re.search(r"\b(?:daughter|son)\s+of\b", low) else 0
-        connector_bonus = sum(1 for t in toks if t.lower() in {"bin", "bint"})
-        weird_penalty = sum(1 for t in toks if len(t) >= 5 and sum(ch.lower() in "aeiou" for ch in t) == 0)
-        return (lineage_bonus, connector_bonus, len(toks), len(n), -weird_penalty)
-    return sorted(candidates, key=score, reverse=True)[0]
+def setup_logger(log_dir: pathlib.Path, verbose: bool) -> logging.Logger:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("ner_extract_model_first")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO if verbose else logging.WARNING)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fh = logging.FileHandler(log_dir / "run.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
 
 
-def canonicalize_name_against_context(name: str, case_ocr: str) -> str:
-    base = normalize_name(name)
-    if not base or not case_ocr:
-        return base
-    candidates = []
-    for item in deterministic_listed_names(case_ocr) + deterministic_named_slaves(case_ocr):
-        nm = normalize_name(item.get("name", ""))
-        if nm and names_maybe_same_person(base, nm):
-            candidates.append(nm)
-    if not candidates:
-        return base
-    low_context = _strip_accents(case_ocr.lower())
-    ranked = sorted(
-        set(candidates + [base]),
-        key=lambda n: (low_context.count(_strip_accents(n.lower())), len(n.split()), len(n)),
-        reverse=True,
-    )
-    return choose_preferred_name(ranked[0], base)
-
-def is_likely_personal_name(name: str) -> bool:
-    if not name:
-        return False
-    n = normalize_name(name)
-    if len(n) < 2:
-        return False
-    low = n.lower()
-    bad_exact = {
-        "woman", "man", "boy", "girl", "slave", "unknown", "unnamed", "a woman", "the woman",
-        "the man", "the boy", "the girl", "the slave", "refugee slave", "slave girl", "slave boy",
-        "dated", "received", "telegram", "code", "approved",
-    }
-    if low in bad_exact:
-        return False
-    if ROLE_TITLE_PAT.search(n) and len(n.split()) <= 5:
-        return False
-    if re.fullmatch(r"[A-Z]\.?(?:\s+[A-Z]\.?)?", n):
-        return False
-    if re.search(r"\b(statement|recorded|political|agency|resident|consulate|memorandum|certificate|delivered|delivery)\b", low):
-        return False
-    toks = [t for t in re.split(r"\s+", n) if t]
-    if not toks:
-        return False
-    if toks[0].lower() in {"at", "from", "to", "the", "a", "an", "and", "my", "these", "this", "where", "when", "now", "sir", "your", "look"}:
-        return False
-    low_tokens = {t.lower() for t in toks}
-    if low_tokens & {"obedient", "servant", "assistant", "agency", "bahrain", "political", "resident", "secretary", "captain", "negroes", "look", "like", "dated", "received", "telegram", "code", "approved"}:
-        return False
-    if len(toks) == 1 and len(toks[0]) <= 2:
-        return False
-    if sum(1 for t in toks if re.search(r"[A-Za-z]", t)) == 0:
-        return False
-    return True
+def progress(message: str) -> None:
+    print(message, flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Ollama client
+# ---------------------------------------------------------------------------
+class OllamaClient:
+    def __init__(self, url: str, model: str, num_predict: int, num_ctx: Optional[int]) -> None:
+        self.url = url
+        self.model = model
+        self.num_predict = num_predict
+        self.num_ctx = num_ctx
+        self.session = requests.Session()
+        self.session.headers.update({"Connection": "keep-alive"})
 
-def normalize_place(raw: str) -> str:
-    if not raw:
-        return ""
-    s = _strip_accents(normalize_ws(raw))
-    s = s.strip(" ,.;:[]{}\"'")
-    s = s.replace("—", "-")
-    s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
-    s = re.sub(r"\bof\s+Negro\s+slave\s+parents\b.*$", "", s, flags=re.I)
-    s = _transport_tail_strip(s)
-    if not s:
-        return ""
+    def generate(self, prompt: str, stats: CallStats, *, num_predict: Optional[int] = None) -> str:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, MAX_CALL_RETRIES + 1):
+            try:
+                payload: Dict[str, Any] = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0,
+                        "num_predict": int(num_predict or self.num_predict),
+                    },
+                }
+                if self.num_ctx:
+                    payload["options"]["num_ctx"] = self.num_ctx
+                stats.model_calls += 1
+                resp = self.session.post(self.url, json=payload, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                return (resp.json().get("response") or "").strip()
+            except (ConnectionError, ReadTimeout, requests.HTTPError) as exc:
+                last_error = exc
+                if attempt < MAX_CALL_RETRIES:
+                    time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+        raise RuntimeError(f"Ollama call failed: {last_error}")
 
-    agency_loc = re.search(
-        r"(?:residency\s+agency|political\s+agency|british\s+government'?s?\s+residency\s+agency)[,\s]+([A-Za-z][A-Za-z'’\-/ ]{2,60})",
-        s,
-        flags=re.I,
-    )
-    if agency_loc:
-        s = agency_loc.group(1)
-
-    s = re.sub(r"^(?:the\s+)?(?:residency\s+agency|political\s+agency|british\s+government'?s?\s+residency\s+agency|the\s+agency|this\s+agency)\b[, ]*", "", s, flags=re.I)
-    s = re.sub(r"^(?:the\s+)?(?:town|port|island|coast)\s+of\s+", "", s, flags=re.I)
-    s = re.sub(r"^(?:at|in|to|from|near|off|via)\s+", "", s, flags=re.I)
-    s = re.split(
-        r"\b(?:named|where|who|whom|which|when|that|while|during|after|before|because|for\s+the\s+purpose|for\s+delivery|recorded|signed|dated|having|leaving|left|tomorrow|yesterday|safely|some\s+months?\s+ago|about\s+\d+\s+(?:years?|months?|days?)\s+ago|\d+\s+(?:years?|months?|days?)\s+(?:ago|previously)|as\s+slaves?\s+to|being\s+sent|intended\s+to|wanted\s+to|kindly\s+arrange|requested\s+to\s+arrange|requested\s+that|with\s+thumb|thumb\s+impressions?|expenses\s+incurred|maintenance|maintaining|ticket|passage|receipt|copy\s+forwarded|and\s+sold\s+to|and\s+was\s+leaving|and\s+were\s+protected|and\s+protected|in\s+a\s+(?:show|boat|dhow|boom|sambuk|sambuks|jallibaut)|in\s+accordance\s+with|whom\b|where\b)\b",
-        s,
-        maxsplit=1,
-        flags=re.I,
-    )[0]
-    s = re.sub(r"\b(?:man-of-war|boat|dhow|steamship|ship|vessel|show|sambuk|sambuks|jallibaut|boom|s\.?s\.?|ss\.?)\b.*$", "", s, flags=re.I)
-    s = normalize_ws(s.strip(" ,.;:"))
-    if not s:
-        return ""
-    low_s = s.lower()
-    if low_s in {"the residency agency", "residency agency", "political agency", "the agency", "this agency", "and", "the", "statement", "memorandum"}:
-        return ""
-    if re.match(r"^(?:the\s+)?house\s+of\b", low_s):
-        return ""
-    if re.match(r"^(?:ruler|chief|shaikh|sheikh|wali|residency\s+agent|political\s+agent)\s+of\b", low_s):
-        return ""
-
-    low = low_s.replace("-", " ")
-    low = re.sub(r"\bras\s+ul\b", "ras al", low)
-    low = re.sub(r"\bul\b", "al", low)
-    low = re.sub(r"\bel\b", "al", low)
-    low = normalize_ws(low)
-    low = low.replace("mlphinstone", "elphinstone")
-    low = low.replace("khnjam", "henjam")
-    low = low.replace("qiighm", "qishm").replace("qighm", "qishm")
-    low = low.replace("dibai", "dubai").replace("debai", "dubai")
-    low = low.replace("shargah", "sharjah")
-
-    mapped = PLACE_MAP.get(low)
-    if mapped:
-        return mapped
-    if len(s) <= 3 and s.isupper():
-        return s
-    words = [w for w in low.split(" ") if w and w not in {"and", "the", "a", "an"}]
-    if not words:
-        return ""
-    cleaned = " ".join(words)
-    if cleaned in {"and", "the", "statement", "memorandum"}:
-        return ""
-    return " ".join([w[:1].upper() + w[1:] if w else w for w in cleaned.split(" ")])
-
-
-def is_valid_place(place: str) -> bool:
-    if not place:
-        return False
-    p = normalize_ws(place)
-    if not p:
-        return False
-    tokens = [t for t in re.split(r"\s+", p) if t]
-    if len(tokens) > MAX_PLACE_WORDS:
-        return False
-    low = p.lower()
-    if BAD_PLACE_TOKEN_PAT.search(low) and len(tokens) >= 4:
-        return False
-    if re.search(r"\d", p):
-        return False
-    if re.search(r"\b(bin|bint|ibn)\b", low):
-        return False
-    if re.search(r"\b(copy|passage|ticket|voy|provided|address|commissioner|police|receipt|officer\s+commanding)\b", low):
-        return False
-    if low in NON_GEO_PLACEHOLDERS or low in {"present owner", "first owner", "second owner"}:
-        return False
-    if re.match(r"^(?:the\s+)?house\s+of\b", low):
-        return False
-    if re.match(r"^(?:ruler|chief|shaikh|sheikh|wali|residency\s+agent|political\s+agent)\s+of\b", low):
-        return False
-    if low in {"residency agency", "political agency", "the residency agency", "this agency", "the agency"}:
-        return False
-    if re.search(r"\b(?:aged|years?|months?|days?|manumission|certificate|slave|master|boat|dhow|show|sambuk|jallibaut|quarter)\b", low) and len(tokens) >= 3:
-        return False
-    return True
-
-
-def is_suspicious_place_string(place: str) -> bool:
-    low = normalize_ws(place).lower()
-    if not low:
-        return False
-    if low in {"and", "the", "statement", "memorandum", "copy", "approved", "politic", "trade"}:
-        return True
-    if re.search(r"\b(?:by\s+the|per\s+s\.?s\.?|by\s+s\.?s\.?|voy\.?|with\s+food|without\s+food|at\s+a\s+cost|cost\s+of)\b", low):
-        return True
-    if re.search(r"\b(?:ticket|passage|receipt|commissioner|police|thumb\s+impressions?|copy\s+forwarded)\b", low):
-        return True
-    return False
-
-
-def evidence_has_strong_route(ev: str) -> bool:
-    low = normalize_ws(ev).lower()
-    return bool(re.search(
-        r"\b(born\s+(?:at|in)|native\s+of|originally\s+lived\s+at|lived\s+at|moved\s+to|kidnapped\s+(?:me|him|her)?\s*from|captured\s+(?:me|him|her)?\s*from|brought\s+(?:me|him|her)?\s+to|taken\s+to|sent\s+(?:me|him|her)?\s+to|was\s+sent\s+to|sold\s+(?:me|him|her)?|arrived\s+at|reached\s+|landed\s+at|escaped(?:\s+and)?\s+to|took\s+refuge\s+at|from\s+[A-Za-z][A-Za-z'’\- ]+\s+to\s+[A-Za-z][A-Za-z'’\- ]+|the\s+following\s+refugee\s+slaves\s+from\s+[A-Za-z].*?arrived\s+at\s+[A-Za-z])\b",
-        low,
-        flags=re.I,
-    ))
-
-
-def evidence_is_admin_or_naval(ev: str) -> bool:
-    low = normalize_ws(ev).lower()
-    return bool(re.search(
-        r"\b(re-joined\s+you\s+in|lying\s+off|h\.?m\.?s\.?|officer\s+commanding|elphinstone\s+inlet|political\s+agency|residency\s+agent|copy\s+forwarded|submitted\s+for\s+information|memorandum|thumb\s+impressions?|maintaining|expenses\s+incurred|ticket|receipt|deck\s+passage|onward\s+journey|for\s+delivery\s+to|handed\s+(?:the\s+same|them|him|her)\s+to|likes?\s+to\s+stay|allowed\s+to\s+live|wishes?\s+to\s+live|desired\s+destination|repatriation(?:\s+of|\s+to)?)\b",
-        low,
-        flags=re.I,
-    ))
-
-
-def evidence_supports_arrival_date(ev: str) -> bool:
-    low = normalize_ws(ev).lower()
-    if not low:
-        return False
-    if not DATE_PAT.search(ev) and not re.search(r"\b(?:some\s+months?\s+ago|about\s+\d+\s+(?:years?|months?|days?)\s+ago|\d+\s+(?:years?|months?|days?)\s+(?:ago|previously)|\d+\s+or\s+\d+\s+years?\s+ago)\b", low):
-        return False
-    return bool(re.search(r"\b(arrived|reached|landed|recorded|dated|sent\s+(?:me|him|her)?\s+to|was\s+sent\s+to|taken\s+to|brought\s+(?:me|him|her)?\s+to|escaped(?:\s+and)?\s+to|took\s+refuge\s+at|from\s+[A-Za-z][A-Za-z'’\- ]+\s+to\s+[A-Za-z][A-Za-z'’\- ]+)\b", low, flags=re.I))
-
-
-def postprocess_places_for_page(current_ocr: str, page_type: str, places: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not places:
-        return []
-    header_loc = extract_header_location(current_ocr)
-    seen: Dict[str, Dict[str, Any]] = {}
-    for p in places:
-        place = normalize_place(str(p.get("place") or p.get("Place") or ""))
-        if not place or not is_valid_place(place) or is_suspicious_place_string(place):
-            continue
-        row = dict(p)
-        row["place"] = place
-        ev = normalize_ws(str(row.get("evidence") or ""))
-        try:
-            order = int(row.get("order", 0) or 0)
-        except Exception:
-            order = 0
-
-        if evidence_is_admin_or_naval(ev) and not evidence_has_strong_route(ev):
-            order = 0
-        if place == "Bushehr" and page_type != "administrative_memo" and evidence_is_admin_or_naval(ev):
-            continue
-        if page_type == "administrative_memo" and not evidence_has_strong_route(ev):
-            order = 0
-        if header_loc and place == header_loc and page_type in {"administrative_memo", "administrative_route"} and not evidence_has_strong_route(ev):
-            order = 0
-
-        if row.get("arrival_date") and not evidence_supports_arrival_date(ev):
-            row["arrival_date"] = ""
-            row["date_confidence"] = ""
-
-        row["order"] = order
-        key = place.lower()
-        cur = seen.get(key)
-        if cur is None:
-            seen[key] = row
-        else:
-            cur_order = int(cur.get("order", 0) or 0)
-            if cur_order == 0 and order > 0:
-                cur["order"] = order
-            elif order > 0 and cur_order > 0:
-                cur["order"] = min(cur_order, order)
-            if not cur.get("arrival_date") and row.get("arrival_date"):
-                cur["arrival_date"] = row.get("arrival_date", "")
-                cur["date_confidence"] = row.get("date_confidence", "")
-            if row.get("time_text") and len(str(row.get("time_text") or "")) > len(str(cur.get("time_text") or "")):
-                cur["time_text"] = row.get("time_text", "")
-            if row.get("evidence") and len(str(row.get("evidence") or "")) > len(str(cur.get("evidence") or "")):
-                cur["evidence"] = row.get("evidence", "")
-
-    positives = [dict(v) for v in seen.values() if int(v.get("order", 0) or 0) > 0]
-    zeroes = [dict(v) for v in seen.values() if int(v.get("order", 0) or 0) == 0]
-    positives.sort(key=lambda x: (int(x.get("order", 0) or 0), normalize_place(str(x.get("place") or ""))))
-    for i, row in enumerate(positives, start=1):
-        row["order"] = i
-    zeroes.sort(key=lambda x: normalize_place(str(x.get("place") or "")))
-    return positives + zeroes
-
-
-def sentence_split(text: str) -> List[str]:
-    text = text.replace("\r", "\n")
-    parts = re.split(r"(?<=[\.!?])\s+|\n{2,}", text)
-    out = [normalize_ws(p) for p in parts if normalize_ws(p)]
-    return out
-
-
-
-def sentence_around(text: str, idx: int, max_words: int = 25) -> str:
-    sentences = sentence_split(text)
-    if not sentences:
-        return ""
-    # approximate lookup by running char lengths
-    running = 0
-    chosen = sentences[0]
-    for s in sentences:
-        running += len(s) + 1
-        if running >= idx:
-            chosen = s
-            break
-    words = chosen.split()
-    return " ".join(words[:max_words])
+    def generate_json(self, prompt: str, schema_hint: str, stats: CallStats, *, num_predict: Optional[int] = None) -> Optional[Any]:
+        raw = self.generate(prompt, stats, num_predict=num_predict)
+        parsed = extract_json(raw)
+        if parsed is not None:
+            return parsed
+        repaired = self.generate(
+            render_prompt(JSON_REPAIR_PROMPT, schema=schema_hint, bad=raw),
+            stats,
+            num_predict=800,
+        )
+        stats.repair_calls += 1
+        return extract_json(repaired)
 
 
 def extract_json(text: str) -> Optional[Any]:
     if not text:
         return None
     text = text.strip()
-    # direct try
     try:
         return json.loads(text)
     except Exception:
         pass
-    # fenced code block
-    m = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", text, flags=re.S)
-    if m:
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", text, flags=re.S)
+    if fenced:
         try:
-            return json.loads(m.group(1))
+            return json.loads(fenced.group(1))
         except Exception:
             pass
-    # outermost object/array
-    start_positions = [pos for pos in [text.find("{"), text.find("[")] if pos != -1]
-    if not start_positions:
+
+    starts = [pos for pos in (text.find("{"), text.find("[")) if pos != -1]
+    if not starts:
         return None
-    start = min(start_positions)
+    start = min(starts)
     opener = text[start]
     closer = "}" if opener == "{" else "]"
     depth = 0
@@ -825,252 +814,751 @@ def extract_json(text: str) -> Optional[Any]:
         elif ch == closer:
             depth -= 1
             if depth == 0:
-                snippet = text[start:i+1]
+                snippet = text[start : i + 1]
                 try:
                     return json.loads(snippet)
                 except Exception:
-                    break
+                    return None
     return None
 
 
-def parse_day_month(text: str) -> Optional[Tuple[int, int]]:
-    if not text:
-        return None
-    s = normalize_ws(text.lower().replace(",", " "))
-    m = re.search(r"\b(\d{1,2})(st|nd|rd|th)?\s+([a-z]+)\b", s)
-    if not m:
-        return None
-    day = int(m.group(1))
-    mon_name = m.group(3)
-    for k, v in MONTHS.items():
-        if mon_name.startswith(k[:3]):
-            return day, v
-    return None
+# ---------------------------------------------------------------------------
+# Light normalization and validation helpers
+# ---------------------------------------------------------------------------
+def normalize_name(name: str) -> str:
+    if not name:
+        return ""
+    s = strip_accents(normalize_ws(name))
+    s = s.strip(" ,.;:[]{}\"'")
+    s = re.sub(r"^(?:the\s+)?slave\s+", "", s, flags=re.I)
+    s = re.sub(r"^(?:mr|mrs|miss|mst)\.?\s+", "", s, flags=re.I)
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
+    s = normalize_ws(s)
+    tokens: List[str] = []
+    for token in s.split():
+        low = token.lower()
+        if low in {"bin", "bint", "al", "el", "ul", "ibn"}:
+            tokens.append("bin" if low == "ibn" else low)
+        elif low in {"abu", "umm"}:
+            tokens.append(low.title())
+        elif low in {"daughter", "son", "of"}:
+            tokens.append(low)
+        else:
+            tokens.append(token[:1].upper() + token[1:])
+    return normalize_ws(" ".join(tokens))
+
+
+def is_valid_name(name: str) -> bool:
+    if not name:
+        return False
+    s = normalize_name(name)
+    if len(s) < 2 or re.search(r"\d", s):
+        return False
+    words = s.split()
+    if not words:
+        return False
+    low_words = {w.lower() for w in words}
+    if low_words & NAME_STOPWORDS and len(words) <= 2:
+        return False
+    if sum(ch.isalpha() for ch in s) < 2:
+        return False
+    return True
+
+
+def normalize_place(place: str) -> str:
+    if not place:
+        return ""
+    s = strip_accents(normalize_ws(place))
+    s = s.strip(" ,.;:[]{}\"'")
+    s = re.sub(r"^\b(?:at|in|to|from|near|via)\b\s+", "", s, flags=re.I)
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
+    s = normalize_ws(s)
+    low = s.lower().replace("-", " ")
+    low = re.sub(r"\s+", " ", low)
+    mapped = PLACE_MAP.get(low)
+    if mapped:
+        return mapped
+    words = [w for w in s.split() if w]
+    if not words:
+        return ""
+    out: List[str] = []
+    for w in words[:6]:
+        if w.lower() in {"al", "ul", "el"}:
+            out.append(w.lower())
+        else:
+            out.append(w[:1].upper() + w[1:])
+    return normalize_ws(" ".join(out))
+
+
+def is_valid_place(place: str) -> bool:
+    if not place:
+        return False
+    s = normalize_place(place)
+    if not s or re.search(r"\d", s):
+        return False
+    low = s.lower()
+    if low in PLACE_STOPWORDS:
+        return False
+    if len(s.split()) > 6:
+        return False
+    if low in {"there", "here", "office", "agency", "residency"}:
+        return False
+    if re.search(r"\b(h\.m\.s\.?|s\.s\.?|steamship|ship|dhow|vessel|boat)\b", low):
+        return False
+    return True
+
+
+def choose_report_type(value: str) -> str:
+    value = normalize_ws(value)
+    value = LEGACY_REPORT_TYPE_MAP.get(value.lower(), value)
+    return value if value in REPORT_TYPES else "correspondence"
+
+
+def choose_allowed(value: Any, allowed: Iterable[str]) -> str:
+    if value is None:
+        return ""
+    v = normalize_ws(str(value))
+    return v if v in set(allowed) else ""
+
+
+def choose_yes_no_blank(value: Any) -> str:
+    v = normalize_ws(str(value or "")).lower()
+    if v in {"yes", "no"}:
+        return v
+    return ""
 
 
 def extract_doc_year(text: str) -> Optional[int]:
-    if not text:
-        return None
-    m = re.search(r"\b(17|18|19|20)\d{2}\b", text)
+    m = re.search(r"\b(17|18|19|20)\d{2}\b", text or "")
     return int(m.group(0)) if m else None
 
 
-def to_iso_date(date_str: str, doc_year: Optional[int] = None) -> Tuple[Optional[str], str]:
-    if not date_str:
-        return None, "unknown"
-    s = normalize_ws(date_str)
-    m_par = re.search(r"\(=\s*([^\)]+)\)", s)
-    if m_par:
-        inner = normalize_ws(m_par.group(1))
-        iso, conf = to_iso_date(inner, doc_year)
-        if iso and conf != "unknown":
-            return iso, conf
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+def parse_day_month(text: str) -> Optional[Tuple[int, int]]:
+    s = normalize_ws((text or "").lower().replace(",", " "))
+    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)\b", s)
+    if not m:
+        return None
+    day = int(m.group(1))
+    mon_name = m.group(2)
+    for month_name, month_num in MONTHS.items():
+        if mon_name.startswith(month_name[:3]):
+            return day, month_num
+    return None
+
+
+def to_iso_date(text: str, doc_year: Optional[int]) -> Tuple[str, str]:
+    if not text:
+        return "", ""
+    s = normalize_ws(text)
+    if ISO_DATE_PAT.match(s):
         return s, "explicit"
+
     m = re.search(r"(?:\bD/?\s*)?(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b", s, flags=re.I)
     if m:
         dd, mm, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
         year = yy
         if yy < 100:
-            base = doc_year if doc_year else 1900
-            century = (base // 100) * 100
-            year = century + yy
+            year = (doc_year // 100) * 100 + yy if doc_year else 1900 + yy
         if 1 <= mm <= 12 and 1 <= dd <= 31:
-            return f"{year:04d}-{mm:02d}-{dd:02d}", "explicit"
+            return f"{year:04d}-{mm:02d}-{dd:02d}", "explicit" if len(m.group(3)) == 4 else "derived_from_doc"
+
     m = re.search(r"\b([A-Z][a-z]+)\s+(\d{1,2}),\s*(\d{4})\b", s)
     if m:
-        mon_name, dd, yyyy = m.group(1), int(m.group(2)), int(m.group(3))
+        month_name, day, year = m.group(1).lower(), int(m.group(2)), int(m.group(3))
         for k, v in MONTHS.items():
-            if mon_name.lower().startswith(k[:3]):
-                return f"{yyyy:04d}-{v:02d}-{dd:02d}", "explicit"
+            if month_name.startswith(k[:3]):
+                return f"{year:04d}-{v:02d}-{day:02d}", "explicit"
+
     m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Z][a-z]+)\s+(\d{4})\b", s)
     if m:
-        dd, mon_name, yyyy = int(m.group(1)), m.group(2), int(m.group(3))
+        day, month_name, year = int(m.group(1)), m.group(2).lower(), int(m.group(3))
         for k, v in MONTHS.items():
-            if mon_name.lower().startswith(k[:3]):
-                return f"{yyyy:04d}-{v:02d}-{dd:02d}", "explicit"
+            if month_name.startswith(k[:3]):
+                return f"{year:04d}-{v:02d}-{day:02d}", "explicit"
+
     dm = parse_day_month(s)
     if dm and doc_year:
-        dd, mm = dm
-        return f"{doc_year:04d}-{mm:02d}-{dd:02d}", "derived_from_doc"
-    return None, "unknown"
+        day, month_num = dm
+        return f"{doc_year:04d}-{month_num:02d}-{day:02d}", "derived_from_doc"
+
+    return "", ""
 
 
-
-
-def extract_header_location(text: str) -> str:
-    if not text:
+def clean_evidence(text: Any) -> str:
+    s = normalize_ws(str(text or ""))
+    if not s:
         return ""
-    pats = [
-        r"\bThe\s+Agency,?\s*([A-Z][A-Za-z'’\-/]+(?:\s+[A-Z][A-Za-z'’\-/]+){0,3})",
-        r"\bPolitical\s+Agency(?:\s*&[^\n]*)?[,:]?\s*([A-Z][A-Za-z'’\-/]+(?:\s+[A-Z][A-Za-z'’\-/]+){0,3})",
-        r"\bBritish\s+Residency(?:\s*&[^\n]*)?[,:]?\s*([A-Z][A-Za-z'’\-/]+(?:\s+[A-Z][A-Za-z'’\-/]+){0,3})",
-        r"\bTo\s*[-:\.]?\s*The\s+Residency\s+Agent[,\-]?\s*([A-Z][A-Za-z'’\-/]+(?:\s+[A-Z][A-Za-z'’\-/]+){0,3})",
-        r"\bFrom\s*[-:\.]?\s*The\s+Residency\s+Agent[,\-]?\s*([A-Z][A-Za-z'’\-/]+(?:\s+[A-Z][A-Za-z'’\-/]+){0,3})",
-        r"\bResidency\s+Agency\s+at\s+([A-Z][A-Za-z'’\-/]+(?:\s+[A-Z][A-Za-z'’\-/]+){0,3})",
-        r"\b([A-Z][A-Za-z'’\-/]+(?:\s+[A-Z][A-Za-z'’\-/]+){0,3}),\s*(?:\d{1,2}(?:st|nd|rd|th)?\s+[A-Z][a-z]+\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-    ]
-    for pat in pats:
-        m2 = re.search(pat, text, flags=re.I)
-        if m2:
-            raw = normalize_ws(m2.group(1))
-            raw = re.sub(r"\b(?:On|To|From|Dated|Date|Under|Secretary|Captain|The)\b.*$", "", raw, flags=re.I).strip(" ,.-")
-            loc = normalize_place(raw)
-            if is_valid_place(loc):
-                return loc
-    return ""
-
-def extract_page_dates(text: str, doc_year: Optional[int]) -> List[Tuple[str, str]]:
-    candidates = []
-    patterns = [
-        r"\(=\s*[^\)]+\)",
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-        r"\b[A-Z][a-z]+\s+\d{1,2},\s*\d{4}\b",
-        r"\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Z][a-z]+\s+\d{4}\b",
-        r"\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Z][a-z]+\b",
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, text):
-            raw = m.group(0)
-            window = text[max(0, m.start()-30):min(len(text), m.end()+30)]
-            if re.search(r"IOR/R|Reference:|M\.S\.|Ms\.|No\.\s*\d+/?\d* of \d{4}", window, flags=re.I):
-                continue
-            iso, conf = to_iso_date(raw, doc_year)
-            if iso:
-                candidates.append((m.start(), iso, conf))
-    candidates.sort(key=lambda x: x[0])
-    seen = set(); uniq=[]
-    for _, iso, conf in candidates:
-        if iso in seen:
-            continue
-        seen.add(iso); uniq.append((iso, conf))
-    return uniq
+    words = s.split()
+    return " ".join(words[:25])
 
 
-def find_amount_paid(text: str) -> Optional[str]:
-    pats = [
-        r"\bpaid\s+([0-9]+(?:\s+[A-Za-z]+)?)\b",
-        r"\bfor\s+([0-9]+\s+rupees?)\b",
-        r"\b([0-9]+\s+rupees?)\b",
-        r"\b([0-9]+\s+dollars?)\b",
+def render_prompt(template: str, **kwargs: Any) -> str:
+    rendered = template
+    for key, value in kwargs.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
+
+
+ROLE_NEGATIVE_PATTERNS = [
+    r"\bsold\s+(?:me\s+)?to\s+(?:one\s+)?{name}\b",
+    r"\bbought\s+by\s+{name}\b",
+    r"\bbelonging\s+to\s+{name}\b",
+    r"\bowner\s+(?:named\s+)?{name}\b",
+    r"\bmaster\s+(?:named\s+)?{name}\b",
+    r"\bstatement\s+recorded\s+by\s+{name}\b",
+    r"\bletter\s+from\s+{name}\b",
+    r"\bsigned\s+before\s+me\s+by\s+{name}\b",
+]
+
+ROLE_POSITIVE_PATTERNS = [
+    r"\bstatement\s+of\s+(?:slave\s+)?{name}\b",
+    r"\bstatement\s+made\s+by\s+{name}\b",
+    r"\bslave\s+{name}\b",
+    r"\bslave\b.*?\bnamed\s+{name}\b",
+    r"\bnamed\s+{name}\b.*?\bslave\b",
+    r"\b1\s+slave\b.*?\bnamed\s+{name}\b",
+    r"\brefugee\s+slaves?\b.*?\b{name}\b",
+    r"\bfor\s+delivery\s+to\s+{name}\b",
+    r"\bgrant\b.*?\bcertificate\b.*?\bto\s+{name}\b",
+    r"\brecommend\b.*?\bcertificate\b.*?\bfor\s+{name}\b",
+    r"\bmanumission\b.*?\b{name}\b",
+    r"\bfree\s+status\b.*?\b{name}\b",
+    r"\b{name}\b.*?\brequests?\s+repatriation\b",
+]
+
+CONFIDENT_ROUTE_PAT = re.compile(
+    r"\b(arriv(?:e|ed|ing)|reached|escaped\s+to|took\s+refuge\s+at|went\s+to|came\s+to|brought\s+(?:me\s+)?to|taken\s+to|sent\s+to|forwarded\b|moved\s+to)\b",
+    flags=re.I,
+)
+UNCERTAIN_ROUTE_PAT = re.compile(
+    r"\b(request(?:ed)?|desired|wish(?:ed|es)?|intend(?:ed)?|propos(?:ed|es)|recommended|recommendation|delivery|certificate|office|agency|administrative|handling|not\s+clearly\s+completed)\b",
+    flags=re.I,
+)
+
+
+def normalize_for_match(text: str) -> str:
+    text = strip_accents(normalize_ws(text)).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return normalize_ws(text)
+
+
+def name_compare_tokens(name: str) -> List[str]:
+    return [
+        tok.lower()
+        for tok in normalize_name(name).split()
+        if tok.lower() not in {"bin", "bint", "ibn", "son", "daughter", "of", "al", "el", "ul"}
     ]
-    for pat in pats:
-        m = re.search(pat, text, flags=re.I)
+
+
+def names_maybe_same_person(a: str, b: str) -> bool:
+    na = normalize_name(a)
+    nb = normalize_name(b)
+    if not na or not nb:
+        return False
+    if na.lower() == nb.lower():
+        return True
+    ta = name_compare_tokens(na)
+    tb = name_compare_tokens(nb)
+    if not ta or not tb:
+        return False
+    if ta[0] != tb[0]:
+        flat_ratio = difflib.SequenceMatcher(None, "".join(ta), "".join(tb)).ratio()
+        return flat_ratio >= 0.92
+    seq_ratio = difflib.SequenceMatcher(None, na.lower(), nb.lower()).ratio()
+    flat_ratio = difflib.SequenceMatcher(None, "".join(ta), "".join(tb)).ratio()
+    overlap = len(set(ta) & set(tb)) / max(len(set(ta)), len(set(tb)), 1)
+    if ta == tb:
+        return True
+    if na.lower() in nb.lower() or nb.lower() in na.lower():
+        return True
+    return seq_ratio >= 0.9 or flat_ratio >= 0.8 or overlap >= 0.75
+
+
+def choose_preferred_name(items: List[Dict[str, str]]) -> Dict[str, str]:
+    def score(item: Dict[str, str]) -> Tuple[int, int, int, str]:
+        name = normalize_name(item.get("name") or "")
+        tokens = name_compare_tokens(name)
+        return (len(tokens), len(name), len(item.get("evidence") or ""), name.lower())
+    return max(items, key=score)
+
+
+def build_name_regex(name: str) -> Optional[re.Pattern[str]]:
+    tokens = [re.escape(tok) for tok in normalize_name(name).split() if tok]
+    if not tokens:
+        return None
+    joined = r"[\s,.;:'\"()\-]+".join(tokens)
+    return re.compile(r"\b" + joined + r"\b", flags=re.I)
+
+
+def iter_name_contexts(name: str, ocr: str, window: int = 140) -> List[str]:
+    pattern = build_name_regex(name)
+    if not pattern or not ocr:
+        return []
+    contexts: List[str] = []
+    for m in pattern.finditer(ocr):
+        start = max(0, m.start() - window)
+        end = min(len(ocr), m.end() + window)
+        contexts.append(normalize_ws(ocr[start:end]))
+    return contexts
+
+
+def compile_name_phrase(pattern_template: str, name: str) -> re.Pattern[str]:
+    tokens = [re.escape(tok) for tok in normalize_name(name).split() if tok]
+    joined = r"[\s,.;:'\"()\-]+".join(tokens) if tokens else r""
+    return re.compile(pattern_template.format(name=joined), flags=re.I | re.S)
+
+
+def has_positive_subject_signal(name: str, text: str) -> bool:
+    if not text:
+        return False
+    for template in ROLE_POSITIVE_PATTERNS:
+        if compile_name_phrase(template, name).search(text):
+            return True
+    return False
+
+
+def has_negative_role_signal(name: str, text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    if re.search(r"\bfree\s*born\b", lower) and re.search(r"\bnot\s+a?\s*slave\b", lower):
+        return True
+    if re.search(rf"\b(?:major|captain|shaikh|sheikh|secretary|agent|political\s+agent|resident)\b.*?\b{re.escape(normalize_name(name).split()[0].lower())}\b", lower):
+        return True
+    for template in ROLE_NEGATIVE_PATTERNS:
+        if compile_name_phrase(template, name).search(text):
+            return True
+    return False
+
+
+def is_freeborn_not_slave_name(name: str, ocr: str) -> bool:
+    for ctx in iter_name_contexts(name, ocr):
+        low = ctx.lower()
+        if "free born" in low and ("not a slave" in low or "not slave" in low):
+            return True
+    return False
+
+
+def keep_subject_name(name: str, evidence: str, ocr: str) -> bool:
+    if not is_valid_name(name):
+        return False
+    if is_freeborn_not_slave_name(name, ocr):
+        return False
+    texts = [clean_evidence(evidence)] + iter_name_contexts(name, ocr)
+    pos = sum(1 for txt in texts if has_positive_subject_signal(name, txt))
+    neg = sum(1 for txt in texts if has_negative_role_signal(name, txt))
+    if pos > 0:
+        return True
+    if neg > 0:
+        return False
+    # conservative fallback: only keep on very strong remaining local wording
+    joined = " ".join(texts).lower()
+    strong_local = [
+        "slave named",
+        "refugee slave",
+        "fugitive slave",
+        "statement of slave",
+        "statement made by",
+        "grant certificate to",
+        "recommend certificate for",
+        "requests repatriation",
+    ]
+    return any(phrase in joined for phrase in strong_local)
+
+
+def filter_named_people(named_people: List[Dict[str, str]], ocr: str) -> List[Dict[str, str]]:
+    kept: List[Dict[str, str]] = []
+    for item in named_people:
+        if keep_subject_name(item.get("name", ""), item.get("evidence", ""), ocr):
+            kept.append(item)
+    return merge_named_people(kept)
+
+
+def parse_first_date_in_text(text: str, doc_year: Optional[int]) -> Tuple[str, str, str]:
+    if not text:
+        return "", "", ""
+    s = normalize_ws(text)
+    m = re.search(r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+(?:\s+\d{4})?)", s)
+    if m:
+        iso, conf = to_iso_date(m.group(1), doc_year)
+        return iso, conf, m.group(1)
+    iso, conf = to_iso_date(s, doc_year)
+    return iso, conf, s if iso else ""
+
+
+def first_text_position(snippet: str, ocr: str) -> int:
+    if not snippet or not ocr:
+        return 10**9
+    idx = ocr.lower().find(snippet.lower())
+    if idx != -1:
+        return idx
+    norm_snippet = normalize_for_match(snippet)
+    norm_ocr = normalize_for_match(ocr)
+    idx = norm_ocr.find(norm_snippet)
+    return idx if idx != -1 else 10**9
+
+
+def first_place_position(place: str, evidence: str, ocr: str) -> int:
+    pos = first_text_position(evidence, ocr)
+    if pos != 10**9:
+        return pos
+    pattern = build_name_regex(place)
+    if pattern:
+        m = pattern.search(ocr)
         if m:
-            return normalize_ws(m.group(1))
+            return m.start()
+    return first_text_position(place, ocr)
+
+
+def is_uncertain_place_text(text: str) -> bool:
+    return bool(UNCERTAIN_ROUTE_PAT.search(text or "")) and not bool(re.search(r"\b(arriv(?:ed|ing)|reached|escaped\s+to|went\s+to|came\s+to)\b", text or "", flags=re.I))
+
+
+def is_confident_place_text(text: str) -> bool:
+    return bool(CONFIDENT_ROUTE_PAT.search(text or ""))
+
+
+def infer_forwarding_transport_rows(name: str, ocr: str, page: int, doc_year: Optional[int]) -> List[Dict[str, Any]]:
+    lower = ocr.lower()
+    if normalize_name(name).lower() not in lower.lower() or not re.search(r"\b(forwarded|forwarding|arriving|arrived)\b", lower):
+        return []
+    rows: List[Dict[str, Any]] = []
+    src_match = re.search(r"^\s*from\s*-\s*.*?,\s*([A-Za-z][A-Za-z' -]+?)\.\s*$", ocr, flags=re.I | re.M)
+    if not src_match:
+        src_match = re.search(r"from\s*-\s*(?:.*?,\s*)?([A-Za-z][A-Za-z' -]+?)\.\s*$", ocr, flags=re.I | re.M)
+    dst_match = re.search(r"arriv(?:ing|ed)\s+([A-Za-z][A-Za-z' -]*[A-Za-z])(?=\s+(?:about\s+the|on|about)\b|[.,;\n])(?:\s+about\s+the\s+|\s+on\s+|\s+about\s+)?([^.,;\n]+)?", ocr, flags=re.I)
+    src = normalize_place(src_match.group(1)) if src_match else ""
+    dst = normalize_place(dst_match.group(1)) if dst_match else ""
+    if src and is_valid_place(src):
+        rows.append({
+            "Name": name, "Page": page, "Place": src, "Order": 1,
+            "Arrival Date": "", "Date Confidence": "", "Time Info": "",
+            "_evidence": clean_evidence(src_match.group(0) if src_match else src),
+            "_force_rank": 1,
+        })
+    if dst and is_valid_place(dst):
+        arrival_date = ""
+        date_conf = ""
+        time_text = ""
+        if dst_match and dst_match.group(2):
+            arrival_date, date_conf, time_text = parse_first_date_in_text(dst_match.group(2), doc_year)
+            if not arrival_date:
+                time_text = normalize_ws(dst_match.group(2))
+        rows.append({
+            "Name": name, "Page": page, "Place": dst, "Order": 2 if src else 1,
+            "Arrival Date": arrival_date, "Date Confidence": date_conf, "Time Info": time_text,
+            "_evidence": clean_evidence(dst_match.group(0) if dst_match else dst),
+            "_force_rank": 2 if src else 1,
+        })
+    return rows
+
+
+def reconcile_place_rows(rows: List[Dict[str, Any]], ocr: str, name: str, page: int, doc_year: Optional[int]) -> List[Dict[str, Any]]:
+    work = [dict(row) for row in rows]
+    work.extend(infer_forwarding_transport_rows(name, ocr, page, doc_year))
+    work = dedupe_place_rows(work, drop_internal=False)
+    if not work:
+        return []
+
+    for row in work:
+        text = normalize_ws(f"{row.get('_evidence', '')} {row.get('Time Info', '')}")
+        row["_position"] = first_place_position(str(row.get("Place") or ""), text, ocr)
+        order = int(row.get("Order", 0) or 0)
+        if order <= 0 and row.get("Arrival Date") and not is_uncertain_place_text(text):
+            row["_promote"] = True
+        elif order <= 0 and is_confident_place_text(text) and not is_uncertain_place_text(text):
+            row["_promote"] = True
+        else:
+            row["_promote"] = False
+
+    route_rows: List[Dict[str, Any]] = []
+    zero_rows: List[Dict[str, Any]] = []
+    for row in work:
+        order = int(row.get("Order", 0) or 0)
+        if order > 0 or row.get("_promote") or row.get("_force_rank"):
+            route_rows.append(row)
+        else:
+            zero_rows.append(row)
+
+    route_rows.sort(key=lambda r: (
+        int(r.get("_force_rank", 10**6) or 10**6),
+        int(r.get("_position", 10**9) or 10**9),
+        int(r.get("Order", 10**6) or 10**6),
+        str(r.get("Place") or "").lower(),
+    ))
+    for idx, row in enumerate(route_rows, start=1):
+        row["Order"] = idx
+
+    zero_rows.sort(key=lambda r: (int(r.get("_position", 10**9) or 10**9), str(r.get("Place") or "").lower()))
+    for row in zero_rows:
+        row["Order"] = 0
+
+    return dedupe_place_rows(route_rows + zero_rows)
+
+
+# ---------------------------------------------------------------------------
+# Parsing model outputs
+# ---------------------------------------------------------------------------
+def parse_page_decision(obj: Any) -> PageDecision:
+    if not isinstance(obj, dict):
+        return PageDecision(True, None, "correspondence", "")
+    should_extract = bool(obj.get("should_extract", True))
+    skip_reason = obj.get("skip_reason")
+    skip_reason = normalize_ws(str(skip_reason)) if skip_reason not in (None, "null") else ""
+    if skip_reason not in {"", "index", "record_metadata", "bad_ocr"}:
+        skip_reason = ""
+    report_type = choose_report_type(str(obj.get("report_type") or "correspondence"))
+    evidence = clean_evidence(obj.get("evidence"))
+    if skip_reason:
+        return PageDecision(False, skip_reason, report_type, evidence)
+    return PageDecision(should_extract, None, report_type, evidence)
+
+
+def parse_named_people(obj: Any) -> List[Dict[str, str]]:
+    if not isinstance(obj, dict):
+        return []
+    merged: Dict[str, Dict[str, str]] = {}
+    for item in obj.get("named_people") or []:
+        if not isinstance(item, dict):
+            continue
+        name = normalize_name(str(item.get("name") or ""))
+        if not is_valid_name(name):
+            continue
+        key = name.lower()
+        evidence = clean_evidence(item.get("evidence"))
+        current = merged.get(key)
+        if current is None or len(name) > len(current["name"]) or len(evidence) > len(current["evidence"]):
+            merged[key] = {"name": name, "evidence": evidence}
+    return list(merged.values())
+
+
+def merge_named_people(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    for group in groups:
+        items.extend(group or [])
+    clusters: List[List[Dict[str, str]]] = []
+    for item in items:
+        placed = False
+        for cluster in clusters:
+            if any(names_maybe_same_person(item["name"], other["name"]) for other in cluster):
+                cluster.append(item)
+                placed = True
+                break
+        if not placed:
+            clusters.append([item])
+    merged = [choose_preferred_name(cluster) for cluster in clusters if cluster]
+    return sorted(merged, key=lambda x: x["name"].lower())
+
+
+def parse_meta(obj: Any, name: str, page: int, report_type: str) -> Dict[str, Any]:
+    data = {
+        "Name": name,
+        "Page": page,
+        "Report Type": report_type,
+        "Crime Type": "",
+        "Whether abuse": "",
+        "Conflict Type": "",
+        "Trial": "",
+        "Amount paid": "",
+    }
+    if not isinstance(obj, dict):
+        return data
+    data["Crime Type"] = choose_allowed(obj.get("crime_type"), CRIME_TYPES)
+    data["Whether abuse"] = choose_yes_no_blank(obj.get("whether_abuse"))
+    data["Conflict Type"] = choose_allowed(obj.get("conflict_type"), CONFLICT_TYPES)
+    data["Trial"] = choose_allowed(obj.get("trial"), TRIAL_TYPES)
+    amount = normalize_ws(str(obj.get("amount_paid") or ""))
+    data["Amount paid"] = "" if amount.lower() in {"null", "none"} else amount
+    return data
+
+
+def parse_places(obj: Any, name: str, page: int, doc_year: Optional[int]) -> List[Dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for item in obj.get("places") or []:
+        if not isinstance(item, dict):
+            continue
+        place = normalize_place(str(item.get("place") or ""))
+        if not is_valid_place(place):
+            continue
+        try:
+            order = int(item.get("order", 0) or 0)
+            order = max(order, 0)
+        except Exception:
+            order = 0
+
+        raw_date = "" if item.get("arrival_date") in (None, "null") else normalize_ws(str(item.get("arrival_date") or ""))
+        arrival_date, inferred_conf = to_iso_date(raw_date, doc_year)
+        date_confidence = normalize_ws(str(item.get("date_confidence") or ""))
+        if date_confidence not in DATE_CONFIDENCE:
+            date_confidence = inferred_conf
+        if not arrival_date:
+            date_confidence = ""
+
+        time_text = normalize_ws(str(item.get("time_text") or ""))
+        if raw_date and not arrival_date and raw_date.lower() not in time_text.lower():
+            time_text = normalize_ws(f"{raw_date}; {time_text}" if time_text else raw_date)
+
+        evidence = clean_evidence(item.get("evidence"))
+        rows.append({
+            "Name": name,
+            "Page": page,
+            "Place": place,
+            "Order": order,
+            "Arrival Date": arrival_date,
+            "Date Confidence": date_confidence,
+            "Time Info": time_text,
+            "_evidence": evidence,
+        })
+    return dedupe_place_rows(rows, drop_internal=False)
+
+
+def model_filter_named_people(client: "OllamaClient", ocr: str, candidates: List[Dict[str, str]], stats: CallStats, *, stage: str) -> List[Dict[str, str]]:
+    if not candidates:
+        return []
+    schema = '{"named_people":[{"name":"...","evidence":"..."}]}'
+    payload = json.dumps(candidates, ensure_ascii=False, indent=2)
+    obj = client.generate_json(
+        render_prompt(NAME_FILTER_PROMPT, stage=stage, candidate_names_json=payload, ocr=ocr),
+        schema,
+        stats,
+        num_predict=900,
+    )
+    filtered = parse_named_people(obj)
+    allowed = {normalize_name(c.get("name") or "").lower(): c for c in candidates}
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for item in filtered:
+        key = normalize_name(item.get("name") or "").lower()
+        if not key or key not in allowed or key in seen:
+            continue
+        ev = clean_evidence(item.get("evidence") or allowed[key].get("evidence") or "")
+        out.append({"name": allowed[key]["name"], "evidence": ev})
+        seen.add(key)
+    return out
+
+
+def model_verify_named_people(client: "OllamaClient", ocr: str, candidates: List[Dict[str, str]], stats: CallStats) -> List[Dict[str, str]]:
+    if not candidates:
+        return []
+    schema = '{"named_people":[{"name":"...","evidence":"..."}]}'
+    payload = json.dumps(candidates, ensure_ascii=False, indent=2)
+    obj = client.generate_json(
+        render_prompt(NAME_VERIFY_PROMPT, candidate_names_json=payload, ocr=ocr),
+        schema,
+        stats,
+        num_predict=900,
+    )
+    filtered = parse_named_people(obj)
+    allowed = {normalize_name(c.get("name") or "").lower(): c for c in candidates}
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for item in filtered:
+        key = normalize_name(item.get("name") or "").lower()
+        if not key or key not in allowed or key in seen:
+            continue
+        ev = clean_evidence(item.get("evidence") or allowed[key].get("evidence") or "")
+        out.append({"name": allowed[key]["name"], "evidence": ev})
+        seen.add(key)
+    return out
+
+def place_row_score(row: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
+    conf_rank = {"": 0, "unknown": 1, "derived_from_doc": 2, "explicit": 3}
+    return (
+        1 if int(row.get("Order", 0) or 0) > 0 else 0,
+        1 if row.get("Arrival Date") else 0,
+        conf_rank.get(str(row.get("Date Confidence") or ""), 0),
+        1 if row.get("Time Info") else 0,
+        len(str(row.get("_evidence") or "")),
+    )
+
+
+def verify_place_rows_need_retry(rows: List[Dict[str, Any]]) -> Optional[str]:
+    if not rows:
+        return "Verifier returned no places."
+    positive = [r for r in rows if int(r.get("Order", 0) or 0) > 0]
+    orders = [int(r.get("Order", 0) or 0) for r in positive]
+    if orders != list(range(1, len(orders) + 1)):
+        return "Positive orders must be consecutive 1..n."
+    seen = set()
+    for row in rows:
+        place = str(row.get("Place") or "").strip().lower()
+        if place in seen:
+            return "Duplicate final places remain after verification."
+        seen.add(place)
+        if not row.get("Arrival Date") and row.get("Date Confidence"):
+            return "Date confidence must be blank when arrival_date is blank."
+    dated_positive = [r for r in positive if r.get("Arrival Date")]
+    for a, b in zip(dated_positive, dated_positive[1:]):
+        if str(a.get("Arrival Date")) > str(b.get("Arrival Date")):
+            return "Positive route order conflicts with arrival dates."
     return None
 
 
-def infer_report_type_from_text(first_page_text: str) -> str:
-    low = (first_page_text or "").lower()
-    manumission_score = 0
-    for pat in [
-        r"manumission certificate", r"grant .* manumission certificate", r"manumitted",
-        r"free man", r"freedom", r"certificate in support of .* freedom", r"re-enslave",
-    ]:
-        if re.search(pat, low):
-            manumission_score += 1
-    return "manumission" if manumission_score >= 1 else "correspondence"
+def dedupe_place_rows(rows: List[Dict[str, Any]], *, drop_internal: bool = True) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    best: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("Name") or "").lower(), str(row.get("Place") or "").lower())
+        current = best.get(key)
+        candidate = dict(row)
+        if current is None or place_row_score(candidate) > place_row_score(current):
+            merged = dict(candidate)
+            if current is not None:
+                if not merged.get("Arrival Date") and current.get("Arrival Date"):
+                    merged["Arrival Date"] = current["Arrival Date"]
+                    merged["Date Confidence"] = current.get("Date Confidence", "")
+                if not merged.get("Time Info") and current.get("Time Info"):
+                    merged["Time Info"] = current["Time Info"]
+                if not merged.get("_evidence") and current.get("_evidence"):
+                    merged["_evidence"] = current["_evidence"]
+            best[key] = merged
+        else:
+            if not current.get("Arrival Date") and candidate.get("Arrival Date"):
+                current["Arrival Date"] = candidate["Arrival Date"]
+                current["Date Confidence"] = candidate.get("Date Confidence", "")
+            if not current.get("Time Info") and candidate.get("Time Info"):
+                current["Time Info"] = candidate["Time Info"]
+            if not current.get("_evidence") and candidate.get("_evidence"):
+                current["_evidence"] = candidate["_evidence"]
+
+    positives = [r for r in best.values() if int(r.get("Order", 0) or 0) > 0]
+    zeroes = [r for r in best.values() if int(r.get("Order", 0) or 0) == 0]
+    positives.sort(key=lambda r: (int(r.get("Order", 0) or 0), str(r.get("Arrival Date") or ""), r["Place"].lower()))
+    for idx, row in enumerate(positives, start=1):
+        row["Order"] = idx
+    zeroes.sort(key=lambda r: (str(r.get("Arrival Date") or ""), r["Place"].lower()))
+    out = positives + zeroes
+    if drop_internal:
+        for row in out:
+            row.pop("_evidence", None)
+            row.pop("_position", None)
+            row.pop("_promote", None)
+            row.pop("_force_rank", None)
+    return out
 
 
+def merge_place_date_enrichment(base_rows: List[Dict[str, Any]], enriched_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not base_rows or not enriched_rows:
+        return dedupe_place_rows(base_rows, drop_internal=False)
+    by_place = {row["Place"].lower(): row for row in base_rows}
+    for row in enriched_rows:
+        target = by_place.get(row["Place"].lower())
+        if not target:
+            continue
+        if not target.get("Arrival Date") and row.get("Arrival Date"):
+            target["Arrival Date"] = row["Arrival Date"]
+            target["Date Confidence"] = row["Date Confidence"]
+        if len(str(row.get("Time Info") or "")) > len(str(target.get("Time Info") or "")):
+            target["Time Info"] = row["Time Info"]
+    return dedupe_place_rows(list(by_place.values()), drop_internal=False)
 
-def classify_document_page(text: str) -> str:
-    """Lightweight page-type classifier used only for gating, not final output labels."""
-    if not text or looks_like_index_page(text):
-        return "index"
-    if looks_like_record_metadata_page(text):
-        return "record_metadata"
-    low = (text or "").lower()
-
-    if re.search(r"\b(statement\s+made\s+by|statement\s+of(?:\s+slave)?|i\s+was\s+born|i\s+was\s+kidnapped|i\s+was\s+brought|i\s+served|i\s+managed\s+to\s+escape)\b", low):
-        return "narrative_statement"
-
-    if re.search(r"\b(was\s+given\s+a\s+manumission\s+certificate|were\s+given\s+manumission\s+certificates|for\s+delivery\s+to\s*:|the\s+following\s+refugee\s+slaves|refugee\s+slaves\s+namely|slave\s*no\.?\s*\d+\s*[:=\-])\b", low):
-        return "administrative_route"
-
-    if re.search(r"\b(first\s+batch\s+of\s+slaves|second\s+batch\s+of\s+slaves|history\s+of\s+the\s+slaves|subsequent\s+investigation|representing\s+themselves\s+as\s+slaves|requesting\s+to\s+be\s+manumitted|wished\s+to\s+be\s+manumitted|originally\s+lived\s+at|they\s+all\s+moved\s+to)\b", low):
-        return "administrative_route"
-
-    if re.search(r"\b(from\s*[-:]?\s*the\s+residency\s+agent|political\s+agency|political\s+resident|consulate|memorandum|forward\s+herewith|submitted\s+for\s+information|copy\s+forwarded|attached\s+report)\b", low):
-        return "administrative_memo"
-
-    return "unknown"
-
-def score_ocr_quality(text: str) -> Tuple[str, Dict[str, Any]]:
-    """Return quality bucket and diagnostics.
-
-    normal: readable enough for full extraction
-    salvageable: noisy but has useful anchors
-    garbled: mostly noise unless strong anchors exist
-    """
-    text = text or ""
-    low = text.lower()
-    tokens = re.findall(r"[A-Za-z][A-Za-z'’\-]*", text)
-    total_tokens = max(1, len(tokens))
-    weird_tokens = sum(1 for t in tokens if len(t) >= 10 and not re.search(r"(?:statement|manumission|certificate|political|residency|agency|resident|bahrein|bahrain|shargah|sharjah|mekran|muscat|zanzibar)", t, re.I) and sum(ch.lower() in 'aeiou' for ch in t) <= 1)
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    repeated_line_ratio = 0.0
-    if lines:
-        counts = {}
-        for ln in lines:
-            key = normalize_ws(ln.lower())
-            counts[key] = counts.get(key, 0) + 1
-        repeated = sum(v for v in counts.values() if v >= 3)
-        repeated_line_ratio = repeated / max(1, len(lines))
-
-    repeated_phrase_hits = 0
-    for phrase in [
-        "reason for its presence there",
-        "on enquiring into the reason",
-        "presence there and on enquiring",
-    ]:
-        if low.count(phrase) >= 2:
-            repeated_phrase_hits += 1
-
-    strong_anchor = bool(re.search(
-        r"\b(statement\s+made\s+by|statement\s+of(?:\s+slave)?|slave\s*no\.?\s*\d+|grant\s+.+?manumission\s+certificate|refugee\s+slaves\s+namely|the\s+following\s+refugee\s+slaves|was\s+given\s+a\s+manumission\s+certificate|were\s+given\s+manumission\s+certificates)\b",
-        low,
-    ))
-
-    short_alpha_lines = sum(1 for ln in lines[:80] if re.search(r"[A-Za-z]", ln) and len(re.findall(r"[A-Za-z]", ln)) < 12)
-    line_count = max(1, len(lines[:80]))
-    short_line_ratio = short_alpha_lines / line_count
-    weird_ratio = weird_tokens / total_tokens
-
-    info = {
-        "strong_anchor": strong_anchor,
-        "repeated_line_ratio": round(repeated_line_ratio, 3),
-        "repeated_phrase_hits": repeated_phrase_hits,
-        "weird_ratio": round(weird_ratio, 3),
-        "short_line_ratio": round(short_line_ratio, 3),
-    }
-
-    if (repeated_phrase_hits >= 1 and repeated_line_ratio >= 0.12) or (weird_ratio >= 0.18 and short_line_ratio >= 0.45):
-        return ("salvageable" if strong_anchor else "garbled"), info
-    if weird_ratio >= 0.10 or repeated_line_ratio >= 0.08:
-        return "salvageable", info
-    return "normal", info
-
-
-
-def page_supports_personal_route(page_type: str, text: str, ocr_quality: str) -> bool:
-    low = (text or "").lower()
-    if page_type == "narrative_statement":
-        return True
-    if page_type == "administrative_route":
-        return True
-    if page_type == "administrative_memo":
-        return bool(re.search(r"\b(last\s+heard\s+of\s+at|was\s+given\s+a\s+manumission\s+certificate|were\s+given\s+manumission\s+certificates|applying\s+for\s+the\s+grant\s+of\s+manumission|sought\s+refuge|took\s+refuge|recorded\s+at|for\s+delivery\s+to|handed\s+(?:the\s+same|them|him|her)\s+to|likes?\s+to\s+stay|came\s+to\s+the\s+Agency\s+Office|maintaining|thumb\s+impressions?|repatriation(?:\s+of|\s+to)?|onward\s+journey|deck\s+passage|passage(?:\s+ticket)?|ticket|per\s+s\.?s\.?|voy\.?|sailed\s+on|arrived\s+at|the\s+following\s+refugee\s+slaves)\b", text, re.I))
-    if page_type == "unknown":
-        if ocr_quality == "garbled":
-            return False
-        return page_has_strong_place_cues(low)
-    return False
 
 def blank_place_row(name: str, page: int) -> Dict[str, Any]:
     return {
-        "Name": normalize_name(name),
+        "Name": name,
         "Page": page,
         "Place": "",
         "Order": "",
@@ -1080,1664 +1568,256 @@ def blank_place_row(name: str, page: int) -> Dict[str, Any]:
     }
 
 
-def _setup_logger(log_dir: str) -> logging.Logger:
-    os.makedirs(log_dir, exist_ok=True)
-    logger = logging.getLogger("ner_extract_multipass")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    fh = logging.FileHandler(os.path.join(log_dir, "run.log"), encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(fmt)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    return logger
-
-
-def write_csv(path: str, rows: List[Dict[str, Any]], columns: List[str]) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=columns)
-        w.writeheader()
-        for row in rows:
-            safe = {k: row.get(k, "") for k in columns}
-            w.writerow(safe)
-    os.replace(tmp, path)
-
-
-def write_state(log_dir: str, state: Dict[str, Any]) -> None:
-    tmp = os.path.join(log_dir, "run_state.json.tmp")
-    path = os.path.join(log_dir, "run_state.json")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-
-# ------------------- OLLAMA -------------------
-def call_ollama(prompt: str, stats: Dict[str, int], *, num_predict: int = DEFAULT_NUM_PREDICT,
-                num_ctx: Optional[int] = DEFAULT_NUM_CTX) -> str:
-    last_err = None
-    for attempt in range(1, MAX_CALL_RETRIES + 1):
-        try:
-            payload = {
-                "model": MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": int(num_predict)},
-            }
-            if num_ctx:
-                payload["options"]["num_ctx"] = int(num_ctx)
-            stats["model_calls"] += 1
-            r = _OLLAMA_SESSION.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            return (r.json().get("response") or "").strip()
-        except (ReadTimeout, ConnectionError) as e:
-            last_err = e
-            wait = RETRY_BACKOFF_SECONDS * attempt
-            time.sleep(wait)
-        except requests.HTTPError as e:
-            last_err = e
-            if attempt < MAX_CALL_RETRIES:
-                time.sleep(2 * attempt)
-            else:
-                break
-    raise RuntimeError(f"Ollama call failed after retries: {last_err}")
-
-
-def call_json_prompt(prompt: str, stats: Dict[str, int], schema_hint: str,
-                     *, num_predict: int = DEFAULT_NUM_PREDICT) -> Optional[Any]:
-    raw = call_ollama(prompt, stats, num_predict=num_predict)
-    parsed = extract_json(raw)
-    if parsed is not None:
-        stats["extract_calls"] += 1
-        return parsed
-    repaired = call_ollama(JSON_REPAIR_PROMPT.format(schema=schema_hint, bad=raw), stats, num_predict=800)
-    stats["repair_calls"] += 1
-    parsed = extract_json(repaired)
-    if parsed is not None:
-        return parsed
-    return None
-
-
-# ------------------- DETERMINISTIC FALLBACKS -------------------
-SLAVERY_CONTEXT_PAT = re.compile(
-    r"\b(slave|enslave|enslaved|manumission|manumitted|free man|freedom|kidnapped|abducted|sold|bought|"
-    r"purchased|re-enslave|re enslave|took refuge|manumission certificate)\b",
-    re.I,
-)
-
-NAME_WORD = r"[A-Z][A-Za-z'’\-]+"
-NAME_CONNECTOR = r"(?:bin|ibn|bint|al|el|ul|Abu|Umm)"
-NAME_SEQ = rf"{NAME_WORD}(?:\s+(?:{NAME_WORD}|{NAME_CONNECTOR})){{0,6}}"
-NAME_WITH_LINEAGE = rf"((?:Mst\.?\s+|Mrs\.?\s+|Miss\s+|Mr\.?\s+)?{NAME_SEQ}(?:\s*,?\s*(?:daughter|son)\s+of\s+{NAME_SEQ})?)"
-FULL_NAME_ONLY_PAT = re.compile(rf"^(?:Mst\.?\s+|Mrs\.?\s+|Miss\s+|Mr\.?\s+)?{NAME_SEQ}(?:\s*,?\s*(?:daughter|son)\s+of\s+{NAME_SEQ})?$", re.I)
-LIST_NAME_PAT = re.compile(NAME_WITH_LINEAGE, re.I)
-
-NAMED_PATTERNS = [
-    re.compile(rf"(?i:\ba slave(?:\s+of\s+[A-Z][A-Za-z'’\-]+)?\s+named\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bdomestic slave\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bmanumission of(?: the)?(?: domestic)? slave\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bstatement\s+made\s+by(?:\s+the)?(?:\s+slave)?(?:\s+girl|\s+boy|\s+woman)?\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bstatement\s+of(?:\s+slave)?\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bgrant\s+)" + NAME_WITH_LINEAGE + r"(?i:\s+a\s+manumission\s+certificate\b)"),
-    re.compile(rf"(?i:\bregarding\s+slave\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bslave\s+)" + NAME_WITH_LINEAGE + r"(?i:\s+who\s+sought\s+refuge)"),
-    re.compile(rf"(?i:\bslave\s+girl[,\s]+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bslave\s+boy[,\s]+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bmanumitted\s+slave\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\b(?:a|the)\s+Baluchi\s+(?:boy|girl)\s+named\s+)" + NAME_WITH_LINEAGE + r"\b"),
-    re.compile(rf"(?i:\bslave\s+)" + NAME_WITH_LINEAGE + r"(?i:[,\.]|\s+is\b|\s+claiming\b|\s+took\b|\s+of\b|\s+aged\b)"),
-]
-
-LIST_NAME_SEG_PAT = re.compile(r"\b(?:refugee\s+slaves?|slaves?)\s+namely\s+(.{0,320})", re.I)
-LIST_CLEAN_PAT = re.compile(r"\b(?:one|two|three|four|five|six|seven|eight)\s+(?:swahilis?|baluchis?|baluch|slaves?|boys?|girls?|women|men)\b", re.I)
-
-
-def _add_name_candidate(out: Dict[str, Dict[str, str]], raw_name: str, evidence: str) -> None:
-    name = normalize_name(raw_name)
-    if not is_likely_personal_name(name):
-        return
-    evidence = normalize_ws(evidence)
-    if not evidence:
-        return
-    key = name.lower()
-    prev = out.get(key)
-    if not prev or len(evidence) > len(prev.get("evidence", "")) or len(name) > len(prev.get("name", "")):
-        out[key] = {"name": name, "evidence": evidence}
-
-
-def _extract_name_from_piece(piece: str) -> str:
-    piece = normalize_ws(piece)
-    if not piece:
-        return ""
-    piece = re.sub(r"^\(?\d+\)?[.):-]?\s*", "", piece)
-    piece = re.sub(r"^No\.?\s*\d+\s*[.:-]?\s*", "", piece, flags=re.I)
-    piece = re.sub(r"^slave\s*no\.?\s*\d+\s*[:=\-]\s*", "", piece, flags=re.I)
-    piece = re.sub(r"\([^)]*\)", "", piece)
-    piece = re.sub(r"\b(?:aged\s+about|born\s+at|recorded\s+on|eldest\s+son|small\s+son)\b.*$", "", piece, flags=re.I)
-    piece = re.sub(r"\b(?:are|is|was|were|who|requests?|requesting|being|forwarded|arriving|accompanies|please|kindly)\b.*$", "", piece, flags=re.I)
-    piece = piece.strip(" ,.;:")
-    if FULL_NAME_ONLY_PAT.match(piece):
-        return normalize_name(piece)
-    return ""
-
-
-def deterministic_listed_names(ocr: str) -> List[Dict[str, str]]:
-    out: Dict[str, Dict[str, str]] = {}
-    text = ocr or ""
-
-    m_under = re.search(r"the\s+undermentioned\s+fugitive\s+slaves[^.]*\.", text, flags=re.I)
-    if m_under:
-        block = text[m_under.end():m_under.end()+900]
-        for line in block.splitlines():
-            line_n = normalize_ws(re.sub(r"\(.*?\)", " ", line))
-            if not line_n:
-                continue
-            if re.search(r"\b(?:provisions|value|total|quarter|article|reference|date|submitted|fresh\s+bread|fresh\s+meat|potatoes|rice|milk|sugar|tea|lbs|tins)\b", line_n, flags=re.I):
-                continue
-            line_n = re.sub(r"-?do-?\.?$", "", line_n, flags=re.I)
-            line_n = re.sub(r"\b\d{1,2}(?:st|nd|rd|th)?\b.*$", "", line_n).strip(" ,.;:-")
-            nm = _extract_name_from_piece(line_n)
-            if nm:
-                _add_name_candidate(out, nm, line_n)
-
-    for m in LIST_NAME_SEG_PAT.finditer(text):
-        seg = re.split(r"[.;:\n]", m.group(1))[0]
-        seg = LIST_CLEAN_PAT.sub(" ", seg)
-        seg = seg.replace(" and ", ", ")
-        for piece in [p.strip() for p in seg.split(',') if p.strip()]:
-            nm = _extract_name_from_piece(piece)
-            if nm:
-                _add_name_candidate(out, nm, sentence_around(text, m.start()) or seg)
-
-    for m in re.finditer(rf"\bslave\s*no\.?\s*\d+\s*[:=\-]\s*" + NAME_WITH_LINEAGE, text, flags=re.I):
-        nm = normalize_name(m.group(1))
-        if nm:
-            _add_name_candidate(out, nm, sentence_around(text, m.start()))
-
-    for m in re.finditer(rf"(?m)^\s*No\.?\s*\d+\s*[.:=-]\s*" + NAME_WITH_LINEAGE + r"\b", text):
-        nm = normalize_name(m.group(1))
-        if nm:
-            _add_name_candidate(out, nm, sentence_around(text, m.start()) or normalize_ws(m.group(0)))
-
-    for m in re.finditer(rf"(?i:\b(?:\d+\s+)?slave(?:\s+young\s+[A-Za-z-]+)?\s+named\s+)" + NAME_WITH_LINEAGE + r"\b", text):
-        nm = normalize_name(m.group(1))
-        if nm:
-            _add_name_candidate(out, nm, sentence_around(text, m.start()) or normalize_ws(m.group(0)))
-
-    seg_pats = [
-        r"forward\s+herewith[^.\n]{0,320}?\bby\s+(.{0,420})",
-        r"made\s+before\s+me\s+by(?:\s+the\s+refugee\s+slaves,)?\s*(.{0,420})",
-        r"for\s+delivery\s+to\s*:?\s*(.{0,420})",
-        r"to\s+say\s+that\s+(.{0,180}?)\s+were\s+given\s+Manumission\s+Certificates",
-        r"the\s+following\s+refugee\s+slaves[^.\n]{0,120}?:\s*(.{0,260})",
-        r"forwarded\s+herewith\s+for\s+favour\s+of\s+delivery\s+to\s+(.{0,220})",
-    ]
-    for pat in seg_pats:
-        for m in re.finditer(pat, text, flags=re.I | re.S):
-            seg = normalize_ws(m.group(1))
-            seg = re.split(r"\b(?:Please|Kindly|U\.E\.|By order|Captain|Secretary|Political Agent)\b", seg, maxsplit=1, flags=re.I)[0]
-            seg = seg.replace(" and ", ", ")
-            seg = re.sub(r"\(\d+\)", ", ", seg)
-            for piece in [p.strip() for p in seg.split(',') if p.strip()]:
-                nm = _extract_name_from_piece(piece)
-                if nm:
-                    _add_name_candidate(out, nm, sentence_around(text, m.start()) or seg)
-
-    undermentioned = re.search(r"the\s+undermentioned\s+fugitive\s+slaves[^.]*[:.]?", text, flags=re.I)
-    if undermentioned:
-        block = text[undermentioned.end():undermentioned.end()+700]
-        for line in block.splitlines():
-            line_n = normalize_ws(re.sub(r"\(.*?\)", " ", line))
-            if not line_n:
-                continue
-            if re.search(r"\b(date|submitted|provisions|value|total|reference|article|quarter|inclusive|march|april|lbs|tins|fresh|rice|milk|sugar|tea)\b", line_n, flags=re.I):
-                continue
-            line_n = re.sub(r"-?do-?\.?$", "", line_n, flags=re.I)
-            line_n = re.sub(r"\b\d{1,2}(?:st|nd|rd|th)?\b.*$", "", line_n).strip(" ,.;:-")
-            nm = _extract_name_from_piece(line_n)
-            if nm:
-                _add_name_candidate(out, nm, line_n)
-
-    list_heading = re.search(r"(?:the\s+following\s+refugee\s+slaves[^.]*\.|First\s+batch\s+of\s+slaves|Second\s+batch\s+of\s+slaves|the\s+persons\s+concerned\s+are)\s*[:.]?", text, flags=re.I)
-    if list_heading:
-        block = text[list_heading.end():list_heading.end()+500]
-        for line in block.splitlines():
-            line_n = normalize_ws(line)
-            if not line_n:
-                continue
-            if re.search(r"\b(dated|memorandum|letter|political agent|secretary|captain|please|kindly|history|investigation)\b", line_n, flags=re.I):
-                continue
-            nm = _extract_name_from_piece(line_n)
-            if nm:
-                _add_name_candidate(out, nm, line_n)
-
-    return list(out.values())
-
-
-def deterministic_named_slaves(ocr: str) -> List[Dict[str, str]]:
-    out: Dict[str, Dict[str, str]] = {}
-    if not ocr or not SLAVERY_CONTEXT_PAT.search(ocr):
-        return []
-    for pat in NAMED_PATTERNS:
-        for m in pat.finditer(ocr):
-            raw = m.group(m.lastindex) if m.lastindex else m.group(0)
-            evidence = sentence_around(ocr, m.start()) or " ".join(ocr[max(0, m.start()-80):m.end()+80].split()[:25])
-            if re.search(r"\b(?:sold\s+me\s+to|sold\s+him\s+to|sold\s+her\s+to|bought\s+by|purchased\s+by|my\s+master(?:'s)?\s+name\s+is)\b", evidence, flags=re.I):
-                if not re.search(r"\b(statement\s+(?:made\s+by|of)|grant\s+.+?manumission\s+certificate|slave\s+girl|slave\s+boy|manumitted\s+slave)\b", evidence, flags=re.I):
-                    continue
-            _add_name_candidate(out, raw, evidence)
-    for item in deterministic_listed_names(ocr):
-        _add_name_candidate(out, item["name"], item["evidence"])
-    return list(out.values())
-
-
-PLACE_CAPTURE = r"([A-Za-z][A-Za-z'’\-/]+(?:\s+(?:of|al|ul|el|in|the|[A-Za-z][A-Za-z'’\-/]+)){0,5})"
-PLACE_REGEXES = [
-    (re.compile(rf"(?i:\bkidnapped\s+(?:me|him|her)?\s*from\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bcaptured\s+(?:me|him|her)?\s*from\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bimported\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bbrought\s+(?:me|him|her)?(?:\s+by\s+land(?:\s+route)?)?\s*to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bsent\s+(?:me|him|her)?\s*to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\b(?:was|were)\s+sent\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bwere\s+to\s+send\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\btaken\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\btaken\b[^\n\.;:]{0,80}?\bto\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bthence(?:\s+shipped\s+me\s+in\s+a\s+boat\s+and\s+landed\s+me\s+at|\s+to|\s+landed\s+me\s+at)\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bfrom\s+there\s+(?:he\s+)?(?:took|brought|sent)\s+(?:me|him|her)?(?:\s+in\s+a\s+boat)?\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bfrom\s+there\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bsailed\s+from\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\blanded\s+(?:me|him|her)?\s+at\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bembark(?:ed)?\s+(?:me|him|her)?(?:\s+in\s+a\s+boat)?\s+and\s+brought\s+(?:me|him|her)?\s+to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bsold\s+(?:me|him|her)?\s*to\s+(?:one|a\s+man|man)\s+of\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\bsold\s+(?:me|him|her)?\s*to\s+[^\n\.\,;:]{0,80}?\bat\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\bsold\s+(?:me|him|her)?\s*to\s+[^\n\.\,;:]{0,80}?\bin\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\bprotected\s+by\s+[^\n\.\,;:]{0,80}?\bat\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(r"(?i:\b(?:escaped|escape(?:d)?)\s+(?:with\s+[^\n\.]{0,40}?\s+)?to\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bcomplained(?:\s+twice)?\s+to\s+.*?\b(?:Agent|Chief),?\s*)" + PLACE_CAPTURE), "assoc"),
-    (re.compile(rf"(?i:\brecorded\s+at\s+(?:the\s+Political\s+Agency,?\s*)?)" + PLACE_CAPTURE), "assoc"),
-    (re.compile(rf"(?i:\bborn\s+at\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bborn\s+in\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bnative\s+of\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bshipped\s+from\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bbirth\s+place\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bmy\s+town\s+is\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bhome\s+is\s+in\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\bnative\s+place\s+)" + PLACE_CAPTURE), "route"),
-    (re.compile(rf"(?i:\boriginally\s+from\s+)" + PLACE_CAPTURE), "route"),
-]
-DATE_PAT = re.compile(r"(?:\(=\s*[^\)]+\)|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b[A-Z][a-z]+\s+\d{1,2},\s*\d{4}\b|\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Z][a-z]+(?:\s+\d{4})?\b|\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b)")
-TIME_TEXT_PAT = re.compile(r"\b(?:when I was[^,.]*|when he was[^,.]*|when she was[^,.]*|aged about[^,.]*|remained with him for[^,.]*|after some years|Two years after[^,.]*|for about one month|for about \d+ years?|about \d+ years? ago|Recorded on[^,.]*|Dated[^,.]*|in the month of [^,.]*|during the summer of last year|at the end of this year's diving season|by \d{1,2}(?:st|nd|rd|th)? [A-Z][a-z]+ \d{4}|[A-Z][a-z]+ \d{4})", re.I)
-
-
-
-def _word_or_digit_to_int(token: str) -> Optional[int]:
-    if not token:
-        return None
-    token = token.lower().strip()
-    if token.isdigit():
-        return int(token)
-    return WORD_NUM.get(token)
-
-
-def extract_anchor_date(text: str, doc_year: Optional[int]) -> Optional[dt.date]:
-    page_dates = extract_page_dates(text or "", doc_year)
-    if not page_dates:
-        return None
-    iso = page_dates[0][0]
-    try:
-        return dt.date.fromisoformat(iso)
-    except Exception:
-        return None
-
-
-def derive_relative_arrival(snippet: str, doc_year: Optional[int], anchor_date: Optional[dt.date] = None) -> Tuple[str, str]:
-    if not snippet:
-        return "", ""
-    low = normalize_ws(snippet).lower()
-    if not doc_year and anchor_date:
-        doc_year = anchor_date.year
-
-    movement_hint = bool(re.search(
-        r"\b(arrived|reached|landed|recorded|sent\s+(?:me|him|her)?\s+to|was\s+sent\s+to|taken\s+to|brought\s+(?:me|him|her)?\s+to|escaped(?:\s+and)?\s+to|took\s+refuge\s+at|moved\s+to|from\s+[A-Za-z][A-Za-z'’\- ]+\s+to\s+[A-Za-z][A-Za-z'’\- ]+)\b",
-        low,
-        flags=re.I,
-    ))
-    if not movement_hint:
-        return "", ""
-
-    if anchor_date:
-        m = re.search(r"\b(?:about\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+(?:ago|previously)\b", low)
-        if m:
-            n = _word_or_digit_to_int(m.group(1))
-            if n:
-                return (anchor_date - dt.timedelta(days=n)).isoformat(), "derived_from_doc"
-
-    m = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+or\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+years?\s+ago\b", low)
-    if m and doc_year:
-        a = _word_or_digit_to_int(m.group(1))
-        b = _word_or_digit_to_int(m.group(2))
-        if a and b:
-            return str(doc_year - max(a, b)), "derived_from_doc"
-
-    m = re.search(r"\b(?:about\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+years?\s+ago\b", low)
-    if m and doc_year:
-        n = _word_or_digit_to_int(m.group(1))
-        if n:
-            return str(doc_year - n), "derived_from_doc"
-
-    m = re.search(r"\b(?:about\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+months?\s+ago\b", low)
-    if m and (anchor_date or doc_year):
-        n = _word_or_digit_to_int(m.group(1))
-        if n:
-            base = anchor_date or dt.date(doc_year, 12, 31)
-            year = base.year
-            month = base.month - n
-            while month <= 0:
-                month += 12
-                year -= 1
-            return f"{year:04d}-{month:02d}", "derived_from_doc"
-
-    if "some months ago" in low and (anchor_date or doc_year):
-        base = anchor_date or dt.date(doc_year, 12, 31)
-        year = base.year if base.month > 3 else base.year - 1
-        month = max(1, base.month - 3)
-        return f"{year:04d}-{month:02d}", "derived_from_doc"
-
-    return "", ""
-
-
-def extract_nearby_date(snippet: str, doc_year: Optional[int], anchor_date: Optional[dt.date] = None) -> Tuple[str, str]:
-    if not snippet:
-        return "", ""
-    m = DATE_PAT.search(snippet)
-    if m:
-        iso, conf = to_iso_date(m.group(0), doc_year=doc_year)
-        return iso or "", conf or ""
-    return derive_relative_arrival(snippet, doc_year, anchor_date)
-
-
-def extract_time_text(snippet: str) -> str:
-    if not snippet:
-        return ""
-    m = TIME_TEXT_PAT.search(snippet)
-    if m:
-        return normalize_ws(m.group(0))
-    rel = re.search(r"\b(?:some\s+months?\s+ago|about\s+\d+\s+(?:years?|months?|days?)\s+ago|\d+\s+(?:years?|months?|days?)\s+(?:ago|previously)|\d+\s+or\s+\d+\s+years?\s+ago|aged\s+about\s+\d+\s+years?)\b", snippet, flags=re.I)
-    return normalize_ws(rel.group(0)) if rel else ""
-
-
-
-def evidence_disqualifies_place(evidence: str, place: str, header_loc: str = "") -> bool:
-    ev = normalize_ws(evidence).lower()
-    p = normalize_place(place).lower()
-    if not p:
-        return True
-    if p in {"residency agency", "political agency", "the residency agency", "this agency", "the agency"}:
-        return True
-
-    # Reject clearly hypothetical sale/destination wording, but keep stay/live/refuge places
-    # because the goal is exhaustive page-local place capture.
-    if any(re.search(pat, ev) for pat in [
-        r"\b(?:being|were|was)\s+sent\s+to\b",
-        r"\bleaving\s+(?:the\s+following\s+day|tomorrow)?\s*for\b",
-        r"\b(?:intended|wanted)\s+to\s+sell\b",
-        r"\bto\s+be\s+sold\s+to\b",
-    ]):
-        if not re.search(r"\b(arrived|reached|landed|took refuge|escaped to|came to|brought me to|brought him to|brought her to|took me to|took him to|took her to|sold .* in|sold .* at|stay at|live at|likes to stay|taken refuge|agency office)\b", ev):
-            return True
-
-    if re.search(r"\b(?:ruler|chief|shaikh|sheikh|wali)\s+of\s+" + re.escape(p) + r"\b", ev):
-        return True
-    if header_loc and p == header_loc.lower() and re.search(r"\b(?:dated|from|to)\b", ev) and not re.search(r"\b(arrived|reached|took refuge|taken refuge|recorded|born|lived|live at|stay at|delivered|delivery|handed|maintaining|came to the agency|agency office)\b", ev):
-        return True
-    return False
-
-def _maybe_add_place(found, pos, raw_place, order_kind, evidence, doc_year, anchor_date=None, default_page_date=("", ""), header_loc=""):
-    place = normalize_place(raw_place)
-    if not is_valid_place(place):
-        return
-    if evidence_disqualifies_place(evidence, place, header_loc):
-        return
-    dt_val, dt_conf = extract_nearby_date(evidence, doc_year, anchor_date)
-    if not dt_val and re.search(r"\b(?:arrived|reached|took refuge|recorded|anchored at|landed at)\b", evidence, flags=re.I):
-        dt_val, dt_conf = default_page_date
-    time_text = extract_time_text(evidence)
-    if not dt_val:
-        dt_conf = ""
-    found.append((pos, place, 1 if order_kind == "route" else 0, dt_val, dt_conf, time_text, evidence))
-
-
-
-
-
-ROUTE_BLOCK_CUES = [
-    r"\bstatement\s+made\s+by\b",
-    r"\bstatement\s+of(?:\s+slave)?\b",
-    r"\bi\s+was\s+born\b",
-    r"\bborn\s+(?:at|in)\b",
-    r"\bnative\s+of\b",
-    r"\bkidnapped\b",
-    r"\bcaptured\b",
-    r"\bimported\s+to\b",
-    r"\bbrought\s+(?:me|him|her)?\s+to\b",
-    r"\btaken\s+to\b",
-    r"\bsent\s+(?:me|him|her)?\s+to\b",
-    r"\bsold\s+(?:me|him|her)?\b",
-    r"\breached\b",
-    r"\bescaped\b",
-    r"\btook\s+refuge\b",
-    r"\bagency\s+office\b",
-    r"\blikes?\s+to\s+stay\b",
-    r"\blive\s+(?:a\s+free\s+life|free life)?\b",
-    r"\bfor\s+delivery\s+to\b",
-    r"\bhanded\s+(?:the\s+same|them|him|her)\s+to\b",
-    r"\bthumb\s+impressions?\b",
-    r"\bmaintaining\b",
-    r"\bthe\s+following\s+refugee\s+slaves\b",
-    r"\barrived\s+at\b",
-    r"\brepatriation\b",
-    r"\bdeck\s+passage\b",
-    r"\bpassage\b",
-    r"\bper\s+s\.?s\.?\b",
-    r"\bvoy\.?\b",
-    r"\bfrom\s+[A-Z][A-Za-z'’\- ]+\s+to\s+[A-Z][A-Za-z'’\- ]+",
-]
-META_BLOCK_CUES = [
-    r"\bill[- ]?treat",
-    r"\bunkind\b",
-    r"\bflog",
-    r"\bbeat",
-    r"\babuse",
-    r"\boppression\b",
-    r"\bmanumission\s+certificate\b",
-    r"\bgrant\b",
-    r"\bfree\s+life\b",
-    r"\brequest\b",
-    r"\bbeg\b",
-    r"\bpaid\b",
-    r"\brs\.?\s*\d",
-]
-
-def _iter_text_blocks(text: str) -> List[Tuple[int, int, str]]:
-    if not text:
-        return []
-    blocks: List[Tuple[int, int, str]] = []
-    for m in re.finditer(r".+?(?:\n\s*\n|\Z)", text, flags=re.S):
-        block = m.group(0).strip()
-        if block:
-            blocks.append((m.start(), m.end(), block))
-    if not blocks:
-        return [(0, len(text), text)]
-    return blocks
-
-def _alias_forms(name: str) -> List[str]:
-    return [a for a in _name_aliases(normalize_name(name)) if a]
-
-def _contains_alias(text: str, aliases: List[str]) -> bool:
-    low = _strip_accents(text.lower())
-    for a in aliases:
-        aa = _strip_accents(a.lower())
-        if aa and re.search(rf"\b{re.escape(aa)}\b", low):
-            return True
-    return False
-
-def _score_name_block(block: str, aliases: List[str], mode: str) -> int:
-    low = _strip_accents(block.lower())
-    score = 0
-    alias_hits = 0
-    for a in aliases:
-        aa = _strip_accents(a.lower())
-        if aa:
-            alias_hits += len(re.findall(rf"\b{re.escape(aa)}\b", low))
-    score += alias_hits * 5
-    cue_list = ROUTE_BLOCK_CUES if mode == "route" else META_BLOCK_CUES
-    for pat in cue_list:
-        if re.search(pat, low, flags=re.I):
-            score += 3
-    if re.search(r"\bstatement\s+made\s+by\b|\bstatement\s+of\b", low, flags=re.I):
-        score += 4
-    if re.search(r"\bi\b|\bmy\b|\bme\b", low):
-        score += 2
-    if len(normalize_ws(block)) < 60:
-        score -= 2
-    if re.search(r"\bsubject\b|\bwith\s+reference\s+to\b", low) and not re.search(r"\b(statement|delivery|handed|stay at|agency|kidnapped|born|sold)\b", low):
-        score -= 2
-    return score
-
-def extract_best_page_local_block(ocr: str, name: str, mode: str = "route", max_chars: int = 12000) -> str:
-    if not ocr or not name:
-        return ocr
-    aliases = _alias_forms(name)
-    if not aliases:
-        return ocr[:max_chars]
-
-    candidates: List[Tuple[int, int, int, str]] = []
-    for start, end, block in _iter_text_blocks(ocr):
-        if _contains_alias(block, aliases):
-            candidates.append((_score_name_block(block, aliases, mode), end - start, start, block))
-
-    low = _strip_accents(ocr.lower())
-    for a in aliases:
-        aa = _strip_accents(a.lower())
-        if not aa:
-            continue
-        for m in re.finditer(rf"\b{re.escape(aa)}\b", low):
-            start = max(0, m.start() - 550)
-            end = min(len(ocr), m.end() + 5200)
-            block = ocr[start:end]
-            candidates.append((_score_name_block(block, aliases, mode), end - start, start, block))
-
-    if not candidates:
-        return ocr[:max_chars]
-
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    best = candidates[0][3].strip()
-    if not best:
-        return ocr[:max_chars]
-    return best[:max_chars]
-
-def extract_route_context_for_name(ocr: str, name: str) -> str:
-    focus = normalize_ws(extract_best_page_local_block(ocr, name, mode="route"))
-    return focus[:12000] if focus else (ocr[:12000] if ocr else "")
-
-
-def _transport_tail_strip(s: str) -> str:
-    s = normalize_ws(s)
-    s = re.split(r"\b(?:by\s+the|by\s+s\.?s\.?|per\s+s\.?s\.?|per\s+ss\.?|on\s+board|voy\.?|with\s+food|without\s+food|at\s+a\s+cost|cost\s+of|and\s+given\s+Rs\.?|given\s+Rs\.?|has\s+been\s+requested|kindly\s+arrange|requested\s+to\s+arrange|per\s+s\b)\b", s, maxsplit=1, flags=re.I)[0]
-    return normalize_ws(s.strip(" ,.;:"))
-
-
-def _extract_vertical_person_names(block: str) -> List[str]:
-    names: List[str] = []
-    started = False
-    for raw in (block or "").splitlines():
-        line = normalize_ws(raw.strip(" 	-•*"))
-        if not line:
-            if started and names:
-                break
-            continue
-        line = re.sub(r"^\(?\d+\)?[\).:-]?\s*", "", line)
-        line = line.strip(" ,.;:")
-        nm = normalize_name(line)
-        if FULL_NAME_ONLY_PAT.match(line) and is_likely_personal_name(nm):
-            names.append(nm)
-            started = True
-            continue
-        if started and len(line.split()) > 4:
-            break
-    return list(dict.fromkeys(names))
-
-
-def _name_matches_listed_name(target: str, candidates: List[str]) -> bool:
-    t_alias = {_strip_accents(a.lower()) for a in _alias_forms(target) if a}
-    for cand in candidates:
-        c_alias = {_strip_accents(a.lower()) for a in _alias_forms(cand) if a}
-        if t_alias & c_alias:
-            return True
-    return False
-
-def page_has_strong_place_cues(text: str) -> bool:
-    low = (text or "").lower()
-    return bool(re.search(
-        r"\b(born\s+(?:at|in)|native\s+of|kidnapped|captured|imported\s+to|brought\s+(?:me|him|her)?\s+to|taken\s+to|sent\s+(?:me|him|her)?\s+to|sold\s+(?:me|him|her)?|reached|escaped|took\s+refuge|agency\s+office|likes?\s+to\s+stay|for\s+delivery\s+to|handed\s+(?:the\s+same|them|him|her)\s+to|thumb\s+impressions?|maintaining|repatriation(?:\s+of|\s+to)?|onward\s+journey|deck\s+passage|passage(?:\s+ticket)?|ticket|per\s+s\.?s\.?|voy\.?|sailed\s+on|the\s+following\s+refugee\s+slaves)\b",
-        low,
-        flags=re.I,
-    ))
-
-def extract_focus_text_for_name(ocr: str, name: str) -> str:
-    # Backward-compatible helper name; now prefer the best page-local block
-    # instead of anchoring on the first occurrence of the name.
-    return extract_route_context_for_name(ocr, name)
-
-
-def deterministic_places_for_page(ocr: str, name: str, doc_year: Optional[int]) -> List[Dict[str, Any]]:
-    header_loc = extract_header_location(ocr)
-    page_dates = extract_page_dates(ocr, doc_year)
-    default_page_date = page_dates[0] if page_dates else ("", "")
-    anchor_date = extract_anchor_date(ocr, doc_year)
-    focus = extract_route_context_for_name(ocr, name)
-    found: List[Tuple[int, str, int, str, str, str, str]] = []
-    aliases = _alias_forms(name)
-    strict_aliases = [a for a in aliases if len(a.split()) >= 2 and a.split()[-1].lower() not in {"bin", "bint", "ibn", "al", "el", "ul"}] or [normalize_name(name)]
-    alias_alt = "|".join(re.escape(a) for a in sorted(strict_aliases, key=len, reverse=True) if a)
-    special_hit = False
-
-    def finalize(found_rows: List[Tuple[int, str, int, str, str, str, str]]) -> List[Dict[str, Any]]:
-        found_rows.sort(key=lambda x: x[0])
-        merged: Dict[str, Dict[str, Any]] = {}
-        route_counter = 0
-        for pos, place, base_order, dt_val, dt_conf, time_text, evidence_raw in found_rows:
-            evidence = " ".join(normalize_ws(evidence_raw).split()[:35])
-            key = place.lower()
-            cur = merged.get(key)
-            if cur is None:
-                route_counter += 1 if base_order > 0 else 0
-                merged[key] = {
-                    "place": place,
-                    "order": route_counter if base_order > 0 else 0,
-                    "arrival_date": dt_val,
-                    "date_confidence": dt_conf if dt_val else "",
-                    "time_text": time_text,
-                    "evidence": evidence,
-                    "_pos": pos,
-                }
-            else:
-                if cur.get("order", 0) == 0 and base_order > 0:
-                    route_counter += 1
-                    cur["order"] = route_counter
-                if not cur.get("arrival_date") and dt_val:
-                    cur["arrival_date"] = dt_val
-                    cur["date_confidence"] = dt_conf if dt_val else ""
-                if time_text and (not cur.get("time_text") or len(time_text) > len(cur.get("time_text", ""))):
-                    cur["time_text"] = time_text
-                if len(evidence) > len(cur.get("evidence", "")):
-                    cur["evidence"] = evidence
-                cur["_pos"] = min(cur.get("_pos", pos), pos)
-        out = sorted(merged.values(), key=lambda x: (0 if x.get("order", 0) > 0 else 1, x.get("order", 0) or 999, x.get("_pos", 0)))
-        for row in out:
-            if not row.get("arrival_date"):
-                row["date_confidence"] = ""
-            row.pop("_pos", None)
-        return out
-
-    shared_pat = re.compile(r"\bthe\s+following\s+refugee\s+slaves\s+from\s+([A-Za-z][A-Za-z'’\-/ ]{2,60}?)\s+arrived\s+at\s+([A-Za-z][A-Za-z'’\-/ ]{2,60}?)(?=\s+by\s+the|\s+by\s+s\.?s\.?|\s*[\.,;]|\s*$)", re.I)
-    for m2 in shared_pat.finditer(ocr):
-        block = ocr[m2.start(): min(len(ocr), m2.end() + 500)]
-        listed = _extract_vertical_person_names(block)
-        if _contains_alias(block, aliases) or _name_matches_listed_name(name, listed):
-            ev = normalize_ws(ocr[m2.start(): min(len(ocr), m2.end() + 25)])
-            _maybe_add_place(found, -100000 + m2.start(), _transport_tail_strip(m2.group(1)), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-            _maybe_add_place(found, -99999 + m2.start(), _transport_tail_strip(m2.group(2)), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
-    # Administrative memo/header places and weak destinations
-    for m2 in re.finditer(r"\brequests?\s+repatriation\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -88000 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-    for m2 in re.finditer(r"political\s+agent,?\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -87900 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-    for m2 in re.finditer(r"instead\s+of\s+sending\s+(?:him|her|them)\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -87800 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-    # Header recipient place such as BUSHIRE on forwarding memoranda
-    for m2 in re.finditer(r"\bBUSHIRE\b|\bBUSHEHR\b|\bBUSHIRE\.\b", ocr, flags=re.I):
-        if _contains_alias(ocr, aliases) and re.search(r"\b(MEMORANDUM|forward\s+herewith|applying\s+for\s+the\s+grant)\b", ocr, flags=re.I):
-            ev = sentence_around(ocr, m2.start(), max_words=20)
-            _maybe_add_place(found, -87700 + m2.start(), "Bushire", "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
-    if alias_alt:
-        transport_pat = re.compile(rf"\b(?:{alias_alt})\b\s+([A-Za-z][A-Za-z'’\-/ ]{{2,40}})\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{{2,40}})(?=\s+(?:per|by)\s+s\.?s\.?|\s+voy\.?|\s*[\.,;]|\s*$)", re.I)
-        for m2 in transport_pat.finditer(ocr):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -90000 + m2.start(), _transport_tail_strip(m2.group(1)), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-            _maybe_add_place(found, -89999 + m2.start(), _transport_tail_strip(m2.group(2)), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
-        repat_pat = re.compile(rf"\brepatriation(?:\s+of\s+[^\n\.;:]{{0,80}})?(?:named\s+)?(?:{alias_alt})[^\n\.;:]{{0,80}}?\bto\s+([A-Za-z][A-Za-z'’\-/ ]{{2,40}})(?=\s*[\.,;]|\s*$)", re.I)
-        for m2 in repat_pat.finditer(ocr):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -85000 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
-    if _contains_alias(ocr, aliases):
-        for m2 in re.finditer(r"\bprovided\s+with\s+a\s+deck\s+passage(?:\s+[^\n\.;:]{0,60})?\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})(?=\s+at\s+a\s+cost|\s+and|\s*[\.,;]|\s*$)", ocr, flags=re.I):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -80000 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            if header_loc:
-                _maybe_add_place(found, -79999 + m2.start(), header_loc, "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
-        for m2 in re.finditer(r"\bonward\s+journey(?:\s+and)?\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})(?=\s*[\.,;]|\s*$)", ocr, flags=re.I):
-            ev = sentence_around(ocr, m2.start(), max_words=35)
-            _maybe_add_place(found, -78000 + m2.start(), _transport_tail_strip(m2.group(1)), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
-        if header_loc and re.search(r"\b(repatriation|passage|ticket|maintaining|for\s+delivery\s+to|handed\s+(?:the\s+same|them|him|her)\s+to)\b", ocr, flags=re.I):
-            ev = sentence_around(ocr, 0, max_words=35)
-            _maybe_add_place(found, -76000, header_loc, "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-            special_hit = True
-
-    # Continue into the generic rules too, so admin/special hits do not suppress page-local narrative places.
-
-    for pat, kind in PLACE_REGEXES:
-        for m2 in pat.finditer(focus):
-            raw_place = normalize_ws(m2.group(1))
-            evidence = sentence_around(focus, m2.start(), max_words=35)
-            _maybe_add_place(found, m2.start(), raw_place, kind, evidence, doc_year, anchor_date, default_page_date, header_loc)
-
-    for m2 in re.finditer(r"\bborn\s+at\s+([A-Za-z][A-Za-z'’\- ]{1,40}),\s*([A-Za-z][A-Za-z'’\- ]{1,40})", focus, flags=re.I):
-        ev = sentence_around(focus, m2.start(), max_words=35)
-        _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-        _maybe_add_place(found, m2.start() + 1, m2.group(2), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-
-    for m2 in re.finditer(r"\bborn\s+at\s+([A-Za-z][A-Za-z'’\- ]{1,40})\s+in\s+([A-Za-z][A-Za-z'’\- ]{1,40})", focus, flags=re.I):
-        ev = sentence_around(focus, m2.start(), max_words=35)
-        _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-        _maybe_add_place(found, m2.start() + 1, m2.group(2), "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-
-    for m2 in re.finditer(r"\b(?:mi\w*grated|moved)\s+from\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})", focus, flags=re.I):
-        ev = sentence_around(focus, m2.start(), max_words=35)
-        _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-        _maybe_add_place(found, m2.start() + 1, m2.group(2), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-
-    for m2 in re.finditer(r"\bbeing\s+sent\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})", focus, flags=re.I):
-        ev = sentence_around(focus, m2.start(), max_words=35)
-        _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-    for m2 in re.finditer(r"\bwere\s+taken\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})", focus, flags=re.I):
-        ev = sentence_around(focus, m2.start(), max_words=35)
-        _maybe_add_place(found, m2.start(), m2.group(1), "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-
-    for pat in [
-        r"\boriginally\s+lived\s+at\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})",
-        r"\blived\s+at\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})",
-        r"\bmoved\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})",
-        r"\bre-joined\s+you\s+in\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})",
-        r"\b(?:we|i|he|she)\s+reached\s+([A-Za-z][A-Za-z'’\-/ ]{2,60})(?:\s+safely)?",
-        r"\breached\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})(?=\s+(?:about|four|three|two|one|\d+)\s+days?\s+ago|\s*[,.;]|\s*$)",
-        r"\baccompanied\s+[^\n\.;:]{0,80}?\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})(?=\s+where|\s+and|\s*[,.;]|\s*$)",
-        r"\bserved[^\n\.;:]{0,80}?\sin\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})(?=\s+and|\s*[,.;]|\s*$)",
-        r"\btransferred\s+(?:me|him|her)?\s+to\s+[^\n\.;:]{0,80}?\bat\s+([A-Za-z][A-Za-z'’\-/ ]{2,40})(?=\s+and|\s*[,.;]|\s*$)",
-        r"\blying\s+off\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\barrived\s+at\s+(?:the\s+)?([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bescaped\s+and\s+arrived\s+at\s+(?:the\s+)?([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\btook\s+refuge\s+at\s+(?:the\s+)?([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bshipped\s+from\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bnative\s+of\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\blikes?\s+to\s+stay(?:\s+with\s+[^\n\.;:]{0,60})?\s+at\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\blive(?:\s+a\s+free\s+life)?\s+(?:at|in)\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bwent\s+to\s+the\s+residency\s+agency\s+at\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bwent\s+to\s+the\s+agency\s+at\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\brepatriation(?:\s+of\s+[^\n\.;:]{0,60})?\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bonward\s+journey(?:\s+and)?\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bpassage(?:\s+ticket)?(?:\s+without\s+food|\s+with\s+food|\s+deck)?\s+to\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\b(?:first|second|present)\s+owner[^\n\.;:]{0,80}?\bof\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-        r"\bsold\s+first[^\n\.;:]{0,80}?\bof\s+([A-Za-z][A-Za-z'’\-/ ]{2,80})",
-    ]:
-        for m2 in re.finditer(pat, focus, flags=re.I):
-            ev = sentence_around(focus, m2.start(), max_words=35)
-            order_kind = "assoc" if re.search(r"likes?\s+to\s+stay|\blive(?:\s+a\s+free\s+life)?\b|repatriation|onward\s+journey|passage", pat, flags=re.I) else "route"
-            _maybe_add_place(found, m2.start(), m2.group(1), order_kind, ev, doc_year, anchor_date, default_page_date, header_loc)
-
-    if header_loc:
-        for m2 in re.finditer(r"\b(?:took\s+refuge|taken\s+refuge|came\s+to\s+the\s+Agency|came\s+to\s+the\s+Agency\s+Office|recorded\s+at\s+the\s+Political\s+Agency|arrived\s+at\s+the\s+Residency\s+Agency|went\s+to\s+the\s+residency\s+Agency|went\s+to\s+the\s+Agency)\b", focus, flags=re.I):
-            ev = sentence_around(focus, m2.start(), max_words=35)
-            _maybe_add_place(found, len(focus) + m2.start(), header_loc, "route", ev, doc_year, anchor_date, default_page_date, header_loc)
-
-        for m2 in re.finditer(r"\b(?:for\s+delivery\s+to|handed\s+(?:the\s+same|them|him|her)\s+to|obtained\s+their\s+thumb\s+impressions|expenses\s+incurred\s+in\s+maintaining|maintaining\s*:|staying\s+with|repatriation|passage|ticket|onward\s+journey)\b", focus, flags=re.I):
-            ev = sentence_around(focus, m2.start(), max_words=35)
-            _maybe_add_place(found, len(focus) + m2.start(), header_loc, "assoc", ev, doc_year, anchor_date, default_page_date, header_loc)
-
-    return finalize(found)
-
-def extract_name_scoped_context(ocr: str, name: str) -> str:
-    text = ocr or ""
-    target = normalize_name(name)
-    if not text or not target:
-        return text
-    focus = normalize_ws(extract_best_page_local_block(text, target, mode="meta"))
-    if focus:
-        return focus[:12000]
-    return text[:12000]
-
-def deterministic_meta(ocr: str, name: str, page: int, report_type: str) -> Dict[str, Any]:
-    scoped = extract_name_scoped_context(ocr, name)
-    low = (scoped or "").lower()
-    crime_type = ""
-    if re.search(r"\b(kidnapped|abducted)\b", low):
-        crime_type = "kidnapping"
-    elif re.search(r"\btraffick", low):
-        crime_type = "trafficking"
-    elif re.search(r"\billegal detention\b|\bdetained against (?:his|her|their|my) will\b", low):
-        crime_type = "illegal detention"
-    elif re.search(r"\bsold\b", low):
-        crime_type = "sale"
-
-    whether_abuse = ""
-    if re.search(r"\b(beat|beaten|abused|ill-treated|ill treated|forced|cruel|violence|assault|maltreat|maltreated|manacles?|imprison|putting me to prison|miseries of .* mistress)\b", low):
-        whether_abuse = "yes"
-    elif re.search(r"\bno abuse\b|\bnot abused\b", low):
-        whether_abuse = "no"
-
-    conflict_type = ""
-    if re.search(r"\b(re-enslave|re enslave|manumission certificate|requesting to be manumitted|wished to be manumitted|wishes that .*? manumission certificate|grant .* manumission certificate|free woman|free man|freedom)\b", low):
-        conflict_type = "manumission dispute"
-    elif re.search(r"\bheirs?\b.*\bcomplain|property of|ownership|claim\b", low):
-        conflict_type = "ownership dispute"
-    elif re.search(r"\bkidnapped|abducted\b", low):
-        conflict_type = "kidnapping case"
-
-    trial = ""
-    if re.search(r"\b(?:requesting|wished|wish(?:es)?|asking)\s+to\s+be\s+manumitted\b|\brequesting .* manumission certificate\b|\bgrant .* manumission certificate\b", low):
-        trial = "manumission certificate requested" if "certificate" in low else "manumission requested"
-    elif re.search(r"\b(?:ascertained|found|proved|established)\b[^.]{0,80}\b(?:free man|free woman|free person)\b", low):
-        trial = "free man confirmed"
-    elif re.search(r"\bwas\s+given\s+a\s+manumission\s+certificate\b|\bwere\s+given\s+manumission\s+certificates\b", low):
-        trial = "manumission granted"
-    elif re.search(r"\breleased\b", low):
-        trial = "released"
-
-    amount_paid = find_amount_paid(scoped) or ""
-
-    return {
-        "Name": name,
-        "Page": page,
-        "Report Type": report_type,
-        "Crime Type": crime_type,
-        "Whether abuse": whether_abuse,
-        "Conflict Type": conflict_type,
-        "Trial": trial,
-        "Amount paid": amount_paid,
-    }
-
-
-def merge_named_candidates(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    for group in groups:
-        for item in group or []:
-            name = normalize_name(item.get("name", ""))
-            if not is_likely_personal_name(name):
-                continue
-            evidence = normalize_ws(item.get("evidence", ""))
-            matched = False
-            for prev in out:
-                if names_maybe_same_person(prev["name"], name):
-                    prev["name"] = choose_preferred_name(prev["name"], name)
-                    if len(evidence) > len(prev.get("evidence", "")):
-                        prev["evidence"] = evidence
-                    matched = True
-                    break
-            if not matched:
-                out.append({"name": name, "evidence": evidence})
-    return out
-
-
-def merge_places(model_places: List[Dict[str, Any]], rule_places: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    merged: Dict[str, Dict[str, Any]] = {}
-    for src in [rule_places or [], model_places or []]:
-        for p in src:
-            place = normalize_place(p.get("place", ""))
-            if not is_valid_place(place):
-                continue
-            key = place.lower()
-            try:
-                order = int(p.get("order", 0))
-            except Exception:
-                order = 0
-            candidate = {
-                "place": place,
-                "order": order,
-                "arrival_date": normalize_ws(str(p.get("arrival_date") or "")),
-                "date_confidence": normalize_ws(str(p.get("date_confidence") or "")),
-                "time_text": normalize_ws(str(p.get("time_text") or "")),
-                "evidence": normalize_ws(str(p.get("evidence") or "")),
-            }
-            if not candidate["arrival_date"]:
-                candidate["date_confidence"] = ""
-            cur = merged.get(key)
-            if cur is None:
-                merged[key] = candidate
-            else:
-                if cur.get("order", 0) == 0 and order > 0:
-                    cur["order"] = order
-                elif order > 0 and cur.get("order", 0) > 0:
-                    cur["order"] = min(cur["order"], order)
-                if not cur.get("arrival_date") and candidate.get("arrival_date"):
-                    cur["arrival_date"] = candidate["arrival_date"]
-                    cur["date_confidence"] = candidate.get("date_confidence", "")
-                if candidate.get("time_text") and (not cur.get("time_text") or len(candidate.get("time_text", "")) > len(cur.get("time_text", ""))):
-                    cur["time_text"] = candidate.get("time_text", "")
-                if len(candidate.get("evidence", "")) > len(cur.get("evidence", "")):
-                    cur["evidence"] = candidate.get("evidence", "")
-    positives = sorted([p for p in merged.values() if p.get("order", 0) > 0], key=lambda x: x["order"])
-    for i, p in enumerate(positives, start=1):
-        p["order"] = i
-    zeroes = [p for p in merged.values() if p.get("order", 0) == 0]
-    return positives + sorted(zeroes, key=lambda x: x["place"])
-
-
-def dedupe_page_rows(detail_rows: List[Dict[str, Any]], place_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    groups: List[Dict[str, Any]] = []
-    for row in detail_rows:
-        nm = normalize_name(str(row.get("Name") or ""))
-        if not is_likely_personal_name(nm):
-            continue
-        placed = False
-        for grp in groups:
-            if names_maybe_same_person(grp["name"], nm):
-                grp["name"] = choose_preferred_name(grp["name"], nm)
-                grp["rows"].append(row)
-                placed = True
-                break
-        if not placed:
-            groups.append({"name": nm, "rows": [row]})
-
-    name_map: Dict[str, str] = {}
-    dedup_detail: List[Dict[str, Any]] = []
-    for grp in groups:
-        best_name = grp["name"]
-        rows = grp["rows"]
-        merged = dict(rows[0])
-        merged["Name"] = best_name
-        for r in rows[1:]:
-            for col in DETAIL_COLUMNS:
-                if col == "Name":
-                    continue
-                if not merged.get(col) and r.get(col):
-                    merged[col] = r.get(col)
-                elif col == "Whether abuse" and r.get(col) == "yes":
-                    merged[col] = "yes"
-                elif col == "Trial":
-                    existing = str(merged.get(col) or "").lower()
-                    incoming = str(r.get(col) or "")
-                    if not existing and incoming:
-                        merged[col] = incoming
-                    elif existing == "manumission requested" and incoming == "manumission certificate requested":
-                        merged[col] = incoming
-        dedup_detail.append(merged)
-        for r in rows:
-            name_map[normalize_name(str(r.get("Name") or ""))] = best_name
-
-    grouped_places: Dict[Tuple[str, Any], List[Dict[str, Any]]] = defaultdict(list)
-    for r in place_rows:
-        nm = normalize_name(str(r.get("Name") or ""))
-        if nm in name_map:
-            newr = dict(r)
-            newr["Name"] = name_map[nm]
-            grouped_places[(newr["Name"], newr.get("Page"))].append(newr)
-
-    dedup_places: List[Dict[str, Any]] = []
-    for (_, _), rows in grouped_places.items():
-        merged_places = merge_places(
-            [{
-                "place": r.get("Place", ""),
-                "order": r.get("Order", 0),
-                "arrival_date": r.get("Arrival Date", ""),
-                "date_confidence": r.get("Date Confidence", ""),
-                "time_text": r.get("Time Info", ""),
-                "evidence": "",
-            } for r in rows if r.get("Place")],
-            []
-        )
-        if not merged_places:
-            dedup_places.append(blank_place_row(rows[0].get("Name", ""), int(rows[0].get("Page") or 0)))
-        else:
-            for p in merged_places:
-                dedup_places.append({
-                    "Name": rows[0].get("Name", ""),
-                    "Page": rows[0].get("Page", ""),
-                    "Place": p.get("place", ""),
-                    "Order": p.get("order", ""),
-                    "Arrival Date": p.get("arrival_date", ""),
-                    "Date Confidence": p.get("date_confidence", "") if p.get("arrival_date") else "",
-                    "Time Info": p.get("time_text", ""),
-                })
-    return dedup_detail, dedup_places
-
-def fill_meta_from_model(base: Dict[str, Any], model_meta: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    mapping = {
-        "crime_type": "Crime Type",
-        "whether_abuse": "Whether abuse",
-        "conflict_type": "Conflict Type",
-        "trial": "Trial",
-        "amount_paid": "Amount paid",
-    }
-    for mk, ck in mapping.items():
-        val = model_meta.get(mk)
-        if val is None:
-            continue
-        sval = normalize_ws(str(val))
-        if not sval or sval.lower() in {"null", "none", "unknown", "n/a"}:
-            continue
-        if ck == "Whether abuse":
-            sval = sval.lower()
-            if sval not in {"yes", "no", ""}:
-                continue
-            if sval == "yes" or not out.get(ck):
-                out[ck] = sval
-            continue
-        out[ck] = sval
-    return out
-
-
-# ------------------- CONTEXT ENRICHMENT -------------------
-def parse_combined_ocr_file(path: str) -> Dict[int, str]:
-    if not path or not os.path.exists(path):
-        return {}
-    txt = pathlib.Path(path).read_text(encoding="utf-8", errors="ignore")
-    out: Dict[int, str] = {}
-    matches = list(re.finditer(r"^Page:\s*(\d+)\.txt\s*$", txt, flags=re.M))
-    for i, m in enumerate(matches):
-        page = int(m.group(1))
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(txt)
-        chunk = txt[start:end]
-        chunk = re.sub(r"View on the Qatar Digital Library:.*", "", chunk)
-        chunk = chunk.replace("------------------------", "\n")
-        chunk = normalize_ws(chunk)
-        if chunk:
-            out[page] = chunk
-    return out
-
-
-
-def looks_like_new_case(text: str) -> bool:
-    head = normalize_ws((text or "")[:220])
-    if not head:
-        return False
-    return bool(re.search(r"\bSubject\s+\d+\b|\bManumission of\b|\bCorrespondence\b|\bTelegram Code\b|\bNo\.\s*\d+\s+of\s+\d{4}\b", head, flags=re.I))
-
-
-def _case_signature_tokens(text: str) -> List[str]:
-    head = normalize_ws((text or "")[:700]).lower()
-    head = head.split("first batch of slaves")[0]
-    toks = [t for t in re.findall(r"[a-z]{4,}", head) if t not in {
-        "from", "date", "submitted", "immediately", "anchored", "board", "slave", "slaves", "statement",
-        "residency", "agent", "political", "resident", "letter", "dated", "page", "this", "that", "with",
-        "have", "when", "they", "them", "their", "there", "were", "was", "been", "which", "would",
-    }]
-    return toks[:25]
-
-
-def same_case_neighbor(a: str, b: str) -> bool:
-    ta = set(_case_signature_tokens(a))
-    tb = set(_case_signature_tokens(b))
-    if not ta or not tb:
-        return False
-    overlap = len(ta & tb)
-    return overlap >= 4 or ("khassab" in ta and "khassab" in tb and "fugitive" in ta and "fugitive" in tb)
-
-
-def _name_aliases(name: str) -> List[str]:
-    n = normalize_name(name).lower()
-    toks = [t for t in n.split() if t]
-    aliases = {n}
-    if len(toks) >= 2:
-        aliases.add(" ".join(toks[:2]))
-        aliases.add(toks[0] + " " + toks[-1])
-    if toks:
-        aliases.add(toks[0])
-    return sorted(a for a in aliases if a)
-
-
-def collect_case_context(page: int, current_ocr: str, name: str, ordered_pages: List[int], page_texts: Dict[int, str]) -> str:
-    if not page_texts or page not in ordered_pages:
-        return current_ocr
-    idx = ordered_pages.index(page)
-    chosen = []
-    aliases = _name_aliases(name)
-    current_type = classify_document_page(current_ocr)
-    current_quality, _ = score_ocr_quality(current_ocr)
-
-    def alias_hit(txt: str) -> bool:
-        low = _strip_accents((txt or "").lower())
-        return any(a and re.search(rf"\b{re.escape(_strip_accents(a.lower()))}\b", low) for a in aliases if len(a) >= 3)
-
-    if idx - 1 >= 0:
-        prev = page_texts.get(ordered_pages[idx - 1], "")
-        if prev and (alias_hit(prev) or same_case_neighbor(prev, current_ocr)):
-            chosen.append(prev)
-
-    chosen.append(page_texts.get(page, current_ocr))
-
-    if idx + 1 < len(ordered_pages):
-        nxt = page_texts.get(ordered_pages[idx + 1], "")
-        if nxt:
-            nxt_type = classify_document_page(nxt)
-            nxt_quality, _ = score_ocr_quality(nxt)
-            continuation_like = re.match(r"^(to the fact|with my mother|she |he |at the end|during |when |i )", normalize_ws(nxt).lower()) is not None
-            include_next = False
-            if alias_hit(nxt) or same_case_neighbor(current_ocr, nxt):
-                include_next = True
-            elif current_type == "narrative_statement" and nxt_type in {"narrative_statement", "unknown"} and nxt_quality != "garbled" and continuation_like and current_quality != "garbled":
-                include_next = True
-            if include_next:
-                chosen.append(nxt)
-
-    for j in range(idx + 2, min(idx + 5, len(ordered_pages))):
-        txt2 = page_texts.get(ordered_pages[j], "")
-        if not txt2:
-            continue
-        txt_quality, _ = score_ocr_quality(txt2)
-        if txt_quality == "garbled":
-            break
-        if alias_hit(txt2) or same_case_neighbor(current_ocr, txt2):
-            chosen.append(txt2)
-        elif looks_like_new_case(txt2):
-            break
-    return "\n\n".join(dict.fromkeys(chosen))
-
-# ------------------- MODEL PASS HELPERS -------------------
-
-def model_named_slaves(ocr: str, stats: Dict[str, int]) -> List[Dict[str, str]]:
-    schema = '{"named_slaves": [{"name": "...", "evidence": "..."}]}'
-    rows_1: List[Dict[str, str]] = []
-    rows_2: List[Dict[str, str]] = []
-
-    obj = call_json_prompt(NAME_PASS_PROMPT.format(ocr=ocr), stats, schema, num_predict=700)
-    if isinstance(obj, dict):
-        for item in obj.get("named_slaves") or []:
-            name = normalize_name(str(item.get("name") or ""))
-            if not is_likely_personal_name(name):
-                continue
-            rows_1.append({"name": name, "evidence": normalize_ws(str(item.get("evidence") or ""))})
-
-    obj = call_json_prompt(NAME_RECALL_PROMPT.format(ocr=ocr), stats, schema, num_predict=700)
-    if isinstance(obj, dict):
-        for item in obj.get("named_slaves") or []:
-            name = normalize_name(str(item.get("name") or ""))
-            if not is_likely_personal_name(name):
-                continue
-            rows_2.append({"name": name, "evidence": normalize_ws(str(item.get("evidence") or ""))})
-
-    return merge_named_candidates(rows_1, rows_2)
-
-
-def _parse_places_obj(obj: Any, doc_year: Optional[int], anchor_date: Optional[dt.date] = None, header_loc: str = "") -> List[Dict[str, Any]]:
-    places: List[Dict[str, Any]] = []
-    if isinstance(obj, dict):
-        for p in obj.get("places") or []:
-            place = normalize_place(str(p.get("place") or ""))
-            if not is_valid_place(place):
-                continue
-            evidence = normalize_ws(str(p.get("evidence") or ""))
-            if evidence_disqualifies_place(evidence, place, header_loc):
-                continue
-            try:
-                order = int(p.get("order", 0))
-            except Exception:
-                order = 0
-            arrival_date = p.get("arrival_date")
-            arrival_date = "" if arrival_date in (None, "null") else normalize_ws(str(arrival_date))
-            inferred_conf = ""
-            if arrival_date:
-                parsed_date, inferred_conf = to_iso_date(arrival_date, doc_year)
-                arrival_date = parsed_date or arrival_date
-            if not arrival_date:
-                arrival_date, inferred_conf = extract_nearby_date(evidence, doc_year, anchor_date)
-            date_confidence = normalize_ws(str(p.get("date_confidence") or "")) or inferred_conf
-            if not arrival_date:
-                date_confidence = ""
-            time_text = normalize_ws(str(p.get("time_text") or "")) or extract_time_text(evidence)
-            places.append({
-                "place": place,
-                "order": order,
-                "arrival_date": arrival_date,
-                "date_confidence": date_confidence,
-                "time_text": time_text,
-                "evidence": evidence,
-            })
-    return places
-
-
-def model_places_for_name(ocr: str, name: str, stats: Dict[str, int]) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Model-first extraction helpers
+# ---------------------------------------------------------------------------
+def model_page_decision(client: "OllamaClient", ocr: str, stats: CallStats, *, report_type_override: Optional[str]) -> PageDecision:
+    if report_type_override:
+        return PageDecision(True, None, choose_report_type(report_type_override), "override")
+    schema = '{"should_extract":true,"skip_reason":null,"report_type":"statement","evidence":"..."}'
+    obj = client.generate_json(render_prompt(PAGE_CLASSIFY_PROMPT, ocr=ocr), schema, stats, num_predict=500)
+    return parse_page_decision(obj)
+
+
+def model_named_people(client: "OllamaClient", ocr: str, stats: CallStats) -> List[Dict[str, str]]:
+    schema = '{"named_people":[{"name":"...","evidence":"..."}]}'
+    first_raw = parse_named_people(client.generate_json(render_prompt(NAME_PASS_PROMPT, ocr=ocr), schema, stats, num_predict=900))
+    first = model_filter_named_people(client, ocr, first_raw, stats, stage="pass-1") or first_raw
+    second_raw = parse_named_people(client.generate_json(render_prompt(NAME_RECALL_PROMPT, ocr=ocr), schema, stats, num_predict=900))
+    second = model_filter_named_people(client, ocr, second_raw, stats, stage="recall-2") or second_raw
+    merged = merge_named_people(first, second)
+    verified = model_verify_named_people(client, ocr, merged, stats) or merged
+    return filter_named_people(verified, ocr)
+
+
+def model_meta_for_name(client: "OllamaClient", ocr: str, name: str, page: int, report_type: str, stats: CallStats) -> Dict[str, Any]:
+    schema = (
+        '{"name":"%s","page":%d,"report_type":"%s","crime_type":null,'
+        '"whether_abuse":"","conflict_type":null,"trial":null,"amount_paid":null,'
+        '"evidence":{"crime_type":null,"whether_abuse":null,"conflict_type":null,"trial":null,"amount_paid":null}}'
+    ) % (name, page, report_type)
+    obj = client.generate_json(
+        render_prompt(META_PASS_PROMPT, name=name, page=page, report_type=report_type, ocr=ocr),
+        schema,
+        stats,
+        num_predict=1000,
+    )
+    return parse_meta(obj, name, page, report_type)
+
+
+def model_places_for_name(client: "OllamaClient", ocr: str, name: str, page: int, stats: CallStats) -> List[Dict[str, Any]]:
     doc_year = extract_doc_year(ocr)
-    anchor_date = extract_anchor_date(ocr, doc_year)
-    header_loc = extract_header_location(ocr)
-    schema = '{"name":"%s","places":[{"place":"...","order":1,"arrival_date":null,"date_confidence":"unknown","time_text":null,"evidence":"..."}]}' % name
-    obj = call_json_prompt(PLACE_PASS_PROMPT.format(name=name, ocr=ocr), stats, schema, num_predict=1100)
-    places = _parse_places_obj(obj, doc_year, anchor_date, header_loc)
-    if len(places) <= 1:
-        obj2 = call_json_prompt(PLACE_RECALL_PROMPT.format(name=name, ocr=ocr), stats, schema, num_predict=1100)
-        places = merge_places(_parse_places_obj(obj2, doc_year, anchor_date, header_loc), places)
-    for p in places:
-        if not p.get("arrival_date"):
-            p["date_confidence"] = ""
-    return places
+    schema = '{"name":"%s","places":[{"place":"...","order":0,"arrival_date":null,"date_confidence":"unknown","time_text":null,"evidence":"..."}]}' % name
+
+    first = parse_places(
+        client.generate_json(render_prompt(PLACE_PASS_PROMPT, name=name, ocr=ocr), schema, stats, num_predict=1200),
+        name,
+        page,
+        doc_year,
+    )
+    second = parse_places(
+        client.generate_json(render_prompt(PLACE_RECALL_PROMPT, name=name, ocr=ocr), schema, stats, num_predict=1200),
+        name,
+        page,
+        doc_year,
+    )
+    merged = dedupe_place_rows(first + second, drop_internal=False)
+    if not merged:
+        return []
+
+    candidate_payload = json.dumps([
+        {
+            "place": row["Place"],
+            "order": row["Order"],
+            "arrival_date": row["Arrival Date"] or None,
+            "date_confidence": row["Date Confidence"] or "unknown",
+            "time_text": row["Time Info"] or None,
+            "evidence": row.get("_evidence") or None,
+        }
+        for row in merged
+    ], ensure_ascii=False, indent=2)
+
+    issues = ""
+    final_rows: List[Dict[str, Any]] = []
+    for attempt in range(2):
+        prompt = render_prompt(
+            PLACE_VERIFY_PROMPT,
+            name=name,
+            page=page,
+            candidate_places_json=(candidate_payload if not issues else candidate_payload + "\n\nIssues to fix:\n- " + issues),
+            ocr=ocr,
+        )
+        verified_obj = client.generate_json(prompt, schema, stats, num_predict=1200)
+        final_rows = parse_places(verified_obj, name, page, doc_year)
+        final_rows = dedupe_place_rows(final_rows, drop_internal=False)
+        issue = verify_place_rows_need_retry(final_rows)
+        if not issue:
+            return dedupe_place_rows(final_rows)
+        issues = issue
+
+    return dedupe_place_rows(final_rows)
 
 
-def model_meta_for_name(ocr: str, name: str, page: int, report_type: str, stats: Dict[str, int]) -> Dict[str, Any]:
-    schema = '{"name":"%s","page":%s,"report_type":"%s","crime_type":null,"whether_abuse":"","conflict_type":null,"trial":null,"amount_paid":null,"evidence":null}' % (name, page, report_type)
-    obj = call_json_prompt(META_PASS_PROMPT.format(name=name, page=page, report_type=report_type, ocr=ocr), stats, schema, num_predict=700)
-    if isinstance(obj, dict):
-        return obj
-    return {}
+# ---------------------------------------------------------------------------
+# Page pipeline
+# ---------------------------------------------------------------------------
+def process_page(
+    client: "OllamaClient",
+    path: pathlib.Path,
+    report_type_override: Optional[str],
+    stats: CallStats,
+) -> Tuple[str, str, List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    page = page_number_from_path(path)
+    ocr = clean_ocr(path.read_text(encoding="utf-8", errors="ignore"))
+    if not normalize_ws(ocr):
+        return "skip:bad_ocr", "correspondence", [], [], "empty OCR"
 
-# ------------------- PAGE PROCESSING -------------------
+    decision = model_page_decision(client, ocr, stats, report_type_override=report_type_override)
+    if not decision.should_extract:
+        skip_reason = decision.skip_reason or "bad_ocr"
+        status = f"skip:{skip_reason}"
+        if status not in STATUS_VALUES:
+            status = "skip:bad_ocr"
+        return status, decision.report_type, [], [], decision.evidence or skip_reason
 
-
-def process_page(current_ocr: str, page: int, filename: str, report_type: str, stats: Dict[str, int], logger: logging.Logger,
-                 ordered_pages: Optional[List[int]] = None, page_texts: Optional[Dict[int, str]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
-    page_type = classify_document_page(current_ocr)
-    if page_type in {"index", "record_metadata"}:
-        return [], [], "skip_index_page"
-
-    ocr_quality, quality_info = score_ocr_quality(current_ocr)
-    if ocr_quality == "garbled" and not quality_info.get("strong_anchor"):
-        return [], [], "skip_bad_ocr"
-
-    doc_year = extract_doc_year(current_ocr)
-    rule_names = deterministic_named_slaves(current_ocr)
-
-    if not rule_names and page_type == "administrative_memo":
-        shortish = len(normalize_ws(current_ocr)) <= 900
-        explicit_name_anchor = bool(re.search(r"\b(?:named\s+[A-Z]|namely|slave\s*no\.?\s*\d+|statement\s+made\s+by|statement\s+of(?:\s+slave)?|grant\s+.+?manumission\s+certificate)\b", current_ocr, flags=re.I))
-        if shortish and not explicit_name_anchor:
-            return [], [], "skip_no_named_slave"
-
-    model_names = []
-    try:
-        model_names = model_named_slaves(current_ocr, stats)
-    except Exception as e:
-        logger.warning("Page %s name-pass failed: %s", page, e)
-
-    names = merge_named_candidates(model_names, rule_names)
+    names = model_named_people(client, ocr, stats)
     if not names:
-        return [], [], "skip_no_named_slave"
+        return "no_named_people", decision.report_type, [], [], "no valid named subjects"
 
     detail_rows: List[Dict[str, Any]] = []
     place_rows: List[Dict[str, Any]] = []
 
     for item in names:
         name = item["name"]
-        if not is_likely_personal_name(name):
-            continue
-
-        page_doc_year = doc_year
-        meta_context = extract_name_scoped_context(current_ocr, name) or current_ocr
-        base_meta = deterministic_meta(meta_context, name, page, report_type)
-        model_meta = {}
-        try:
-            model_meta = model_meta_for_name(meta_context, name, page, report_type, stats)
-        except Exception as e:
-            logger.warning("Page %s meta-pass failed for %s: %s", page, name, e)
-        meta = fill_meta_from_model(base_meta, model_meta)
-
-        canonical_name = canonicalize_name_against_context(str(meta.get("Name") or name), current_ocr)
-        meta["Name"] = canonical_name
-
-        if meta.get("Trial", "").lower() == "free man confirmed" and re.search(r"\brequest(?:ing)?\s+to\s+be\s+manumitted\b|\bwished\s+to\s+be\s+manumitted\b", meta_context, flags=re.I):
-            meta["Trial"] = "manumission requested"
-        if not meta.get("Conflict Type") and re.search(r"\brequest(?:ing)?\s+to\s+be\s+manumitted\b|\bwished\s+to\s+be\s+manumitted\b|\bmanumission certificate\b", meta_context, flags=re.I):
-            meta["Conflict Type"] = "manumission dispute"
-        if not meta.get("Whether abuse") and re.search(r"\b(miseries of .* mistress|maltreat|beating|putting me to prison|manacles?|ill[- ]?treat|unkind|oppression|flog|without food|forced to go out pearl diving)\b", meta_context, flags=re.I):
-            meta["Whether abuse"] = "yes"
-
+        meta = model_meta_for_name(client, ocr, name, page, decision.report_type, stats)
         detail_rows.append(meta)
 
-        allow_route = page_supports_personal_route(page_type, current_ocr, ocr_quality)
-        route_context = extract_route_context_for_name(current_ocr, canonical_name) or current_ocr
-        det_places = deterministic_places_for_page(route_context, canonical_name, page_doc_year) if allow_route else []
-        model_places = []
-        if allow_route:
-            try:
-                model_places = model_places_for_name(route_context, canonical_name, stats)
-            except Exception as e:
-                logger.warning("Page %s place-pass failed for %s: %s", page, canonical_name, e)
-
-            if not merge_places(det_places, model_places) and page_has_strong_place_cues(current_ocr):
-                broad_det = deterministic_places_for_page(current_ocr, canonical_name, page_doc_year)
-                broad_model = []
-                try:
-                    broad_model = model_places_for_name(current_ocr, canonical_name, stats)
-                except Exception as e:
-                    logger.warning("Page %s place-retry failed for %s: %s", page, canonical_name, e)
-                det_places = merge_places(broad_det, det_places)
-                model_places = merge_places(broad_model, model_places)
-
-        places = merge_places(det_places, model_places)
-        places = postprocess_places_for_page(current_ocr, page_type, places)
-
-        positive_count = 0
-        try:
-            positive_count = sum(1 for p in places if int(p.get("order", 0) or 0) > 0)
-        except Exception:
-            positive_count = 0
-        if allow_route and current_ocr != route_context and page_has_strong_place_cues(current_ocr) and positive_count < 3:
-            broad_det = deterministic_places_for_page(current_ocr, canonical_name, page_doc_year)
-            broad_model = []
-            try:
-                broad_model = model_places_for_name(current_ocr, canonical_name, stats)
-            except Exception as e:
-                logger.warning("Page %s place-broad-retry failed for %s: %s", page, canonical_name, e)
-            places = merge_places(places, merge_places(broad_det, broad_model))
-            places = postprocess_places_for_page(current_ocr, page_type, places)
-
-        if not places:
-            place_rows.append(blank_place_row(canonical_name, page))
+        places = model_places_for_name(client, ocr, name, page, stats)
+        if places:
+            place_rows.extend(places)
         else:
-            for p in places:
-                place_rows.append({
-                    "Name": canonical_name,
-                    "Page": page,
-                    "Place": p.get("place", ""),
-                    "Order": p.get("order", ""),
-                    "Arrival Date": p.get("arrival_date", ""),
-                    "Date Confidence": p.get("date_confidence", "") if p.get("arrival_date") else "",
-                    "Time Info": p.get("time_text", ""),
-                })
+            place_rows.append(blank_place_row(name, page))
 
-    detail_rows = [r for r in detail_rows if is_likely_personal_name(str(r.get("Name") or ""))]
-    place_rows = [r for r in place_rows if is_likely_personal_name(str(r.get("Name") or ""))]
-
-    detail_rows, place_rows = dedupe_page_rows(detail_rows, place_rows)
-
-    valid_names = {normalize_name(r["Name"]) for r in detail_rows}
-    place_rows = [r for r in place_rows if normalize_name(r.get("Name", "")) in valid_names]
-
-    seen_place_names = {normalize_name(r.get("Name", "")) for r in place_rows}
-    for r in detail_rows:
-        nm = normalize_name(r["Name"])
-        if nm not in seen_place_names:
-            place_rows.append(blank_place_row(r["Name"], int(r.get("Page", page) or page)))
-            seen_place_names.add(nm)
-
-    if not detail_rows:
-        return [], [], "skip_no_named_slave"
-
-    return detail_rows, place_rows, "ok"
+    return "ok", decision.report_type, detail_rows, place_rows, f"{len(names)} named people"
 
 
-def _read_existing_csv_rows(path: str, columns: List[str]) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    rows: List[Dict[str, Any]] = []
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                clean = {k: normalize_ws(row.get(k, "")) for k in columns}
-                rows.append(clean)
-    except Exception:
-        return []
-    return rows
-
-def _page_int(value: Any) -> Optional[int]:
-    s = normalize_ws(str(value or ""))
-    m = re.search(r"\d+", s)
-    return int(m.group(0)) if m else None
-
-def _group_rows_by_page(rows: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
-    grouped: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        p = _page_int(row.get("Page") if "Page" in row else row.get("page"))
-        if p is not None:
-            grouped[p].append(row)
-    return grouped
-
-def _detail_page_incomplete(rows: List[Dict[str, Any]]) -> bool:
-    if not rows:
-        return True
-    meta_cols = ["Crime Type", "Whether abuse", "Conflict Type", "Trial", "Amount paid"]
-    return all(not normalize_ws(str(r.get(col) or "")) for r in rows for col in meta_cols)
-
-def _place_page_incomplete(rows: List[Dict[str, Any]]) -> bool:
-    if not rows:
-        return True
-    return all(not normalize_ws(str(r.get("Place") or "")) for r in rows)
-
-
-def _page_rows_suspicious(current_ocr: str,
-                          detail_rows: List[Dict[str, Any]],
-                          place_rows: List[Dict[str, Any]]) -> bool:
-    nonblank_places = [r for r in place_rows if normalize_ws(str(r.get("Place") or ""))]
-    if any(is_suspicious_place_string(str(r.get("Place") or "")) for r in nonblank_places):
-        return True
-
-    page_type = classify_document_page(current_ocr)
-    pos_orders = []
-    by_name = defaultdict(list)
-    for r in nonblank_places:
-        by_name[normalize_name(str(r.get("Name") or ""))].append(r)
-        try:
-            pos_orders.append(int(r.get("Order") or 0))
-        except Exception:
-            pass
-
-    if page_type == "administrative_memo" and sum(1 for x in pos_orders if x > 0) >= 3:
-        return True
-
-    if page_type == "narrative_statement" and nonblank_places and sum(1 for x in pos_orders if x > 0) == 0 and page_has_strong_place_cues(current_ocr):
-        return True
-
-    if re.search(r"\bthe\s+following\s+refugee\s+slaves\s+from\b", current_ocr, flags=re.I):
-        for _, rows_for_name in by_name.items():
-            uniq = {normalize_place(str(r.get("Place") or "")) for r in rows_for_name if normalize_place(str(r.get("Place") or ""))}
-            if len(uniq) < 2:
-                return True
-
-    if re.search(r"\b(?:from\s+[A-Z][A-Za-z'’\- ]+\s+to\s+[A-Z][A-Za-z'’\- ]+|provided\s+with\s+a\s+deck\s+passage\s+to\s+[A-Z]|arrived\s+at\s+[A-Z][A-Za-z'’\- ]+\s+by\s+the\s+s\.?s\.?)\b", current_ocr, flags=re.I):
-        uniq_all = {normalize_place(str(r.get("Place") or "")) for r in nonblank_places if normalize_place(str(r.get("Place") or ""))}
-        if len(uniq_all) < 2:
-            return True
-
-    detail_names = {normalize_name(str(r.get("Name") or "")) for r in detail_rows if normalize_name(str(r.get("Name") or ""))}
-    names_with_places = {normalize_name(str(r.get("Name") or "")) for r in nonblank_places if normalize_name(str(r.get("Name") or ""))}
-    if detail_names and page_has_strong_place_cues(current_ocr) and not detail_names.issubset(names_with_places):
-        return True
-
-    return False
-
-
-def _read_existing_status_rows(path: str) -> List[Dict[str, Any]]:
-    return _read_existing_csv_rows(path, STATUS_COLUMNS) if os.path.exists(path) else []
-
-def _page_status_map(rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-    out: Dict[int, Dict[str, Any]] = {}
-    for row in rows:
-        p = _page_int(row.get("page"))
-        if p is not None:
-            out[p] = row
-    return out
-
-def should_process_page(page: int,
-                        current_ocr: str,
-                        detail_by_page: Dict[int, List[Dict[str, Any]]],
-                        place_by_page: Dict[int, List[Dict[str, Any]]],
-                        status_by_page: Dict[int, Dict[str, Any]]) -> bool:
-    drows = detail_by_page.get(page, [])
-    prows = place_by_page.get(page, [])
-
-    if _page_rows_suspicious(current_ocr, drows, prows):
-        return True
-
-    if prows and not _place_page_incomplete(prows):
-        return False
-
-    prev_status = normalize_ws(str(status_by_page.get(page, {}).get("status", ""))).lower()
-    if not drows and not prows and prev_status in {"skip_index_page", "skip_bad_ocr", "skip_no_named_slave"}:
-        return False
-
-    return True
-
-
-def _replace_page_rows(all_rows: List[Dict[str, Any]], page: int, new_rows: List[Dict[str, Any]], page_key: str) -> List[Dict[str, Any]]:
-    kept = [r for r in all_rows if _page_int(r.get(page_key)) != page]
-    kept.extend(new_rows)
-    kept.sort(key=lambda r: (_page_int(r.get(page_key)) or 0, normalize_name(str(r.get("Name") or r.get("name") or ""))))
-    return kept
-
-def _replace_status_row(status_rows: List[Dict[str, Any]], page: int, new_row: Dict[str, Any]) -> List[Dict[str, Any]]:
-    kept = [r for r in status_rows if _page_int(r.get("page")) != page]
-    kept.append(new_row)
-    kept.sort(key=lambda r: (_page_int(r.get("page")) or 0))
-    return kept
-
-def assert_runtime_integrity() -> None:
-    required = [
-        "normalize_name",
-        "is_valid_place",
-        "merge_places",
-        "dedupe_page_rows",
-        "process_page",
-        "deterministic_meta",
-        "fill_meta_from_model",
-    ]
-    missing = [name for name in required if not callable(globals().get(name))]
-    if missing:
-        raise RuntimeError(f"Missing required helpers: {', '.join(missing)}")
-
-
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Multipass slave extraction with incremental CSV output.")
-    parser.add_argument("--in_dir", default="/data/input")
-    parser.add_argument("--out_dir", default="/data/output")
-    parser.add_argument("--text_out_dir", default="/data/text_out")  # compatibility only
-    parser.add_argument("--log_dir", default="/data/logs")
-    parser.add_argument("--report_type", default=None, help="Optional fixed report type; if omitted, infer from first page.")
-    parser.add_argument("--save_debug_json", action="store_true")
-    parser.add_argument("--combined_ocr_path", default=None, help="Optional combined OCR file with Page: XXXX.txt sections.")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Model-first OCR extractor for historical slavery/manumission pages.")
+    ap.add_argument("--in_dir", default="/data/input", help="Directory containing page-level OCR .txt files")
+    ap.add_argument("--out_dir", default="/data/output", help="Directory for CSV outputs")
+    ap.add_argument("--text_out_dir", default="/data/text_out")  # compatibility only
+    ap.add_argument("--log_dir", default="/data/logs", help="Directory for run.log")
+    ap.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama /api/generate URL")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name")
+    ap.add_argument("--num-predict", type=int, default=DEFAULT_NUM_PREDICT, help="Default Ollama num_predict")
+    ap.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX, help="Default Ollama num_ctx")
+    ap.add_argument("--report-type", default=None, help="Optional fixed report type override for all pages")
+    ap.add_argument("--verbose", action="store_true", help="Verbose logging to run.log")
+    args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-    logger = _setup_logger(args.log_dir)
-    assert_runtime_integrity()
+    out_dir = pathlib.Path(args.out_dir)
+    log_dir = pathlib.Path(args.log_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(log_dir, args.verbose)
 
-    detail_path = os.path.join(args.out_dir, "Detailed info.csv")
-    place_path = os.path.join(args.out_dir, "name place.csv")
-    status_path = os.path.join(args.log_dir, "run_status.csv")
-    debug_dir = os.path.join(args.out_dir, "debug_json")
-    if args.save_debug_json:
-        os.makedirs(debug_dir, exist_ok=True)
+    detail_path = out_dir / "Detailed info.csv"
+    place_path = out_dir / "name place.csv"
+    status_path = out_dir / "run_status.csv"
 
-    files = sorted([p for p in pathlib.Path(args.in_dir).glob("*.txt") if re.fullmatch(r"\d+", p.stem)])
+    files = sorted(pathlib.Path(args.in_dir).glob("*.txt"), key=lambda p: (page_number_from_path(p), p.name))
     if not files:
         logger.error("No .txt files found in %s", args.in_dir)
+        progress(f"[0/0] no .txt files found in {args.in_dir}")
         write_csv(detail_path, [], DETAIL_COLUMNS)
         write_csv(place_path, [], PLACE_COLUMNS)
         write_csv(status_path, [], STATUS_COLUMNS)
         return
 
-    first_page_text = "\n\n".join(fp.read_text(encoding="utf-8", errors="ignore") for fp in files[: min(5, len(files))])
-    report_type = args.report_type or infer_report_type_from_text(first_page_text)
-    logger.info("Using report type: %s", report_type)
+    client = OllamaClient(
+        url=args.ollama_url,
+        model=args.model,
+        num_predict=args.num_predict,
+        num_ctx=args.num_ctx,
+    )
 
-    combined_candidate = args.combined_ocr_path
-    if not combined_candidate:
-        auto = pathlib.Path(args.in_dir) / "PDF extracted text.txt"
-        if auto.exists():
-            combined_candidate = str(auto)
-    combined_map = parse_combined_ocr_file(combined_candidate) if combined_candidate else {}
-    ordered_pages: List[int] = []
-    page_texts: Dict[int, str] = {}
-    for fp in files:
-        pnum = int(re.sub(r"\D", "", fp.stem) or 0)
-        ordered_pages.append(pnum)
-        page_texts[pnum] = combined_map.get(pnum) or fp.read_text(encoding="utf-8", errors="ignore")
-
-    all_detail_rows = _read_existing_csv_rows(detail_path, DETAIL_COLUMNS)
-    all_place_rows = _read_existing_csv_rows(place_path, PLACE_COLUMNS)
-    status_rows = _read_existing_status_rows(status_path)
-
-    detail_by_page = _group_rows_by_page(all_detail_rows)
-    place_by_page = _group_rows_by_page(all_place_rows)
-    status_by_page = _page_status_map(status_rows)
-
-    state = {
-        "started_at": dt.datetime.utcnow().isoformat() + "Z",
-        "report_type": report_type,
-        "processed_pages": [],
-        "resume_mode": bool(all_detail_rows or all_place_rows),
-    }
+    all_detail_rows: List[Dict[str, Any]] = []
+    all_place_rows: List[Dict[str, Any]] = []
+    status_rows: List[Dict[str, Any]] = []
 
     write_csv(detail_path, all_detail_rows, DETAIL_COLUMNS)
     write_csv(place_path, all_place_rows, PLACE_COLUMNS)
     write_csv(status_path, status_rows, STATUS_COLUMNS)
-    write_state(args.log_dir, state)
 
-    pages_to_run: List[int] = []
-    for fp in files:
-        page = int(re.sub(r"\D", "", fp.stem) or 0)
-        current_ocr = page_texts.get(page) or fp.read_text(encoding="utf-8", errors="ignore")
-        if should_process_page(page, current_ocr, detail_by_page, place_by_page, status_by_page):
-            pages_to_run.append(page)
+    progress(f"Starting extraction: {len(files)} page(s) | model={args.model} | input={args.in_dir}")
 
-    logger.info("Pages selected for processing: %s", pages_to_run)
-    print(f"Pages selected for processing: {pages_to_run}", flush=True)
-
-    page_file_map = {int(re.sub(r"\D", "", fp.stem) or 0): fp for fp in files}
-
-    for page in pages_to_run:
-        fp = page_file_map[page]
+    total = len(files)
+    for idx, path in enumerate(files, start=1):
         t0 = time.time()
-        filename = fp.name
-        ocr = fp.read_text(encoding="utf-8", errors="ignore")
-        stats = {"model_calls": 0, "extract_calls": 0, "repair_calls": 0}
+        stats = CallStats()
+        status = "error"
         note = ""
-        status = "ok"
+        report_type = choose_report_type(args.report_type or "correspondence")
         detail_rows: List[Dict[str, Any]] = []
         place_rows: List[Dict[str, Any]] = []
+        page = page_number_from_path(path)
+
+        progress(f"[{idx}/{total}] page={page} file={path.name} starting")
 
         try:
-            detail_rows, place_rows, status = process_page(ocr, page, filename, report_type, stats, logger, ordered_pages, page_texts)
-            if status != "ok":
-                note = status
-
-            if args.save_debug_json:
-                dbg = {
-                    "page": page,
-                    "filename": filename,
-                    "report_type": report_type,
-                    "detail_rows": detail_rows,
-                    "place_rows": place_rows,
-                    "status": status,
-                    "stats": stats,
-                }
-                with open(os.path.join(debug_dir, f"{fp.stem}.json"), "w", encoding="utf-8") as f:
-                    json.dump(dbg, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.exception("Page %s failed", page)
+            status, report_type, detail_rows, place_rows, note = process_page(
+                client=client,
+                path=path,
+                report_type_override=args.report_type,
+                stats=stats,
+            )
+            if status == "ok":
+                all_detail_rows.extend(detail_rows)
+                all_place_rows.extend(place_rows)
+        except Exception as exc:
+            logger.exception("Failed page %s", path.name)
             status = "error"
-            note = str(e)
-            detail_rows = []
-            place_rows = []
+            note = str(exc)
 
-        if status == "ok":
-            all_detail_rows = _replace_page_rows(all_detail_rows, page, detail_rows, "Page")
-            all_place_rows = _replace_page_rows(all_place_rows, page, place_rows, "Page")
+        elapsed = round(time.time() - t0, 2)
+        status_rows.append({
+            "page": page,
+            "filename": path.name,
+            "status": status,
+            "named_people": len(detail_rows),
+            "detail_rows": len(detail_rows),
+            "place_rows": len(place_rows),
+            "model_calls": stats.model_calls,
+            "repair_calls": stats.repair_calls,
+            "elapsed_seconds": elapsed,
+            "note": note,
+        })
 
         write_csv(detail_path, all_detail_rows, DETAIL_COLUMNS)
         write_csv(place_path, all_place_rows, PLACE_COLUMNS)
-
-        elapsed = round(time.time() - t0, 2)
-        status_row = {
-            "page": page,
-            "filename": filename,
-            "status": status,
-            "named_slaves": len({r['Name'] for r in detail_rows}) if detail_rows else 0,
-            "detail_rows": len(detail_rows),
-            "place_rows": len(place_rows),
-            "model_calls": stats["model_calls"],
-            "extract_calls": stats["extract_calls"],
-            "repair_calls": stats["repair_calls"],
-            "elapsed_seconds": elapsed,
-            "note": note,
-        }
-        status_rows = _replace_status_row(status_rows, page, status_row)
         write_csv(status_path, status_rows, STATUS_COLUMNS)
 
-        state["processed_pages"].append({
-            "page": page,
-            "filename": filename,
-            "status": status,
-            "named_slaves": len({r['Name'] for r in detail_rows}) if detail_rows else 0,
-            "model_calls": stats["model_calls"],
-            "elapsed_seconds": elapsed,
-        })
-        write_state(args.log_dir, state)
-        logger.info("Processed page=%s status=%s named=%s model_calls=%s elapsed_seconds=%s", page, status,
-                    len({r['Name'] for r in detail_rows}) if detail_rows else 0, stats["model_calls"], elapsed)
-        print(f"[page {page}] status={status} named={len({r['Name'] for r in detail_rows}) if detail_rows else 0} "
-              f"model_calls={stats['model_calls']} elapsed_seconds={elapsed}", flush=True)
+        progress(
+            f"[{idx}/{total}] done page={page} status={status} report={report_type} "
+            f"people={len(detail_rows)} places={len(place_rows)} "
+            f"calls={stats.model_calls}/{stats.repair_calls} time={elapsed}s"
+        )
 
-    state["finished_at"] = dt.datetime.utcnow().isoformat() + "Z"
-    write_state(args.log_dir, state)
-    logger.info("Done. Detailed rows=%s Place rows=%s", len(all_detail_rows), len(all_place_rows))
+        logger.info(
+            "page=%s status=%s report_type=%s named_people=%s place_rows=%s model_calls=%s repair_calls=%s",
+            page,
+            status,
+            report_type,
+            len(detail_rows),
+            len(place_rows),
+            stats.model_calls,
+            stats.repair_calls,
+        )
+
+    progress(f"Finished: {len(status_rows)} page(s) processed | detail_rows={len(all_detail_rows)} | place_rows={len(all_place_rows)}")
+
 
 if __name__ == "__main__":
     main()

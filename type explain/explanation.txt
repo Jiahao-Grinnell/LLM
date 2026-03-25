@@ -1,0 +1,60 @@
+Report types:
+
+* `statement`: recorded testimony, declaration, or first-person account
+
+* `transport/admin`: logistics, expenses, passage, repatriation arrangements, maintenance, reimbursement, certificate handling, or administrative movement
+
+* `correspondence`: any official letter, telegram, memo, recommendation, forwarding note, or investigative office communication.
+
+
+Crime Type:
+* `kidnapping`: use when the page says the person was **abducted, seized, carried off, or stolen away** against their will, often from home, family, tribe, or native place.
+
+* `sale`: use when the page clearly says the person was **sold by one person to another**, and the key fact being described is the transaction itself.
+
+* `trafficking`: use when the page describes a **broader chain of transport-and-sale activity**, especially movement through multiple intermediaries, brokers, ports, or regions as part of a slave-trading process, not just one isolated sale.
+
+* `illegal detention`: use when the page says the person was **kept, confined, imprisoned, or prevented from leaving**, especially when the focus is on unlawful holding rather than sale or transport.
+
+* `forced transfer`: use when the page shows the person was **taken or sent from one place or owner to another against their will**, but the page does not clearly frame it primarily as kidnapping or sale.
+
+* `debt-claim transfer`: use when the page says the person was **claimed, held, or transferred because of a debt, debt dispute, repayment claim, or obligation**, rather than through an ordinary sale alone.
+
+
+Conflict type:
+* `manumission dispute`: use when the page is about whether the person should be **freed, granted a manumission certificate, or recognized as entitled to release**.
+
+* `ownership dispute`: use when the main issue is **who owns or claims the person**, including competing masters or contested possession.
+
+* `debt dispute`: use when the case centers on a **debt, repayment claim, or financial obligation** affecting the person’s status, holding, or transfer.
+
+* `free-status dispute`: use when the issue is whether the person is **already free, was wrongly treated as enslaved, or should be recognized as not legally enslaved**.
+
+* `forced-transfer dispute`: use when the page centers on a dispute over the person being **taken, sent, or moved against their will** from one place or controller to another.
+
+* `repatriation dispute`: use when the main issue is whether, where, or how the person should be **sent back or allowed to return** to a home place, homeland, or chosen destination.
+
+* `kidnapping case`: use when the page frames the matter primarily as a **kidnapping/abduction case**, rather than just a later ownership or manumission issue.
+
+
+
+Trial type:
+* `manumission requested`: use when the page says the person **asked for freedom** or sought release, but does not specifically mention a certificate.
+
+* `manumission certificate requested`: use when the page explicitly asks that a **manumission certificate** be issued or given.
+
+* `manumission recommended`: use when an official or office says the person **should be granted manumission** or that a certificate **may be granted**, but it has not yet been clearly granted on that page.
+
+* `manumission granted`: use when the page clearly shows that freedom or the **manumission certificate has been approved/granted**, not merely requested or recommended.
+
+* `free status confirmed`: use when the page states that the person’s **status as free** has been recognized or confirmed.
+
+* `released`: use when the page says the person was **let go, set at liberty, discharged, or freed from custody/control**, without necessarily focusing on a formal certificate.
+
+* `repatriation arranged`: use when the page says arrangements were made to **send the person back** or forward them to a home or chosen destination.
+
+* `certificate delivered`: use when the page says the certificate was **sent, forwarded for delivery, or actually delivered** to the person or the responsible office.
+
+
+
+
