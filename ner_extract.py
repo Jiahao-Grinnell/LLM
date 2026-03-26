@@ -91,7 +91,6 @@ REPORT_TYPES = {
 }
 
 LEGACY_REPORT_TYPE_MAP = {
-    "telegram": "correspondence",
     "investigation/correspondence": "correspondence",
     "official correspondence": "correspondence",
 }
@@ -211,14 +210,19 @@ Allowed report_type values:
 - correspondence
 
 Definitions:
-- statement: recorded testimony, declaration, or first-person account
-- transport/admin: logistics, expenses, passage, repatriation arrangements, maintenance, reimbursement, certificate handling, or administrative movement
-- correspondence: any official letter, telegram, memo, recommendation, forwarding note, or investigative office communication
+- statement: a recorded testimony, declaration, or first-person account by a subject or witness
+- transport/admin: the page's main purpose is handling movement, repatriation, passage, maintenance, routing, subsistence, certificate delivery, reimbursement, or other case administration
+- correspondence: an official communication page whose main purpose is discussion, recommendation, forwarding, inquiry, or notification, rather than transport/admin case handling
 
-Guidelines:
-- Choose statement when the page is mainly a recorded personal account or formal declaration by a subject or witness.
-- Choose transport/admin when the page is mainly about passage, repatriation, transport, maintenance, reimbursement, delivery, routing, or similar administrative handling.
-- Choose correspondence for official communication pages of all other kinds, including letters, telegrams, memoranda, investigative discussion, recommendations, and forwarding notes.
+Critical rule:
+- Classify by the MAIN FUNCTION of the page, not by document form.
+- A telegram, letter, or memo can still be transport/admin if its main purpose is repatriation, passage, maintenance, routing, delivery, or other case handling.
+- Only use correspondence when the page is mainly communicative/discussive and not mainly handling transport/admin matters.
+
+Decision hints:
+- Choose statement for "Statement of...", "I was born...", "I request...", recorded testimony, or declarations.
+- Choose transport/admin for pages about repatriation requests/arrangements, passage, delivery to a place, being taken to a place, subsistence, provisions, maintenance charges, or certificate handling.
+- Choose correspondence for general office communication, recommendations, investigative discussion, forwarding notes, and updates that do not mainly handle transport/admin logistics.
 
 Skip only when the page is clearly one of these:
 - index or list page
@@ -914,6 +918,15 @@ def choose_report_type(value: str) -> str:
     return value if value in REPORT_TYPES else "correspondence"
 
 
+def override_report_type_from_ocr(ocr: str, current: str) -> str:
+    text = normalize_ws(ocr)
+    if STATEMENT_REPORT_PAT.search(text):
+        return "statement"
+    if TRANSPORT_ADMIN_REPORT_PAT.search(text):
+        return "transport/admin"
+    return current
+
+
 def choose_allowed(value: Any, allowed: Iterable[str]) -> str:
     if value is None:
         return ""
@@ -1032,6 +1045,20 @@ CONFIDENT_ROUTE_PAT = re.compile(
 )
 UNCERTAIN_ROUTE_PAT = re.compile(
     r"\b(request(?:ed)?|desired|wish(?:ed|es)?|intend(?:ed)?|propos(?:ed|es)|recommended|recommendation|delivery|certificate|office|agency|administrative|handling|not\s+clearly\s+completed)\b",
+    flags=re.I,
+)
+
+TRANSPORT_ADMIN_REPORT_PAT = re.compile(
+    r"\b("
+    r"repatriation|repatriate|passage|transport|taken\s+to|sent\s+to|for\s+delivery\s+to|"
+    r"delivered\s+to|arrange(?:d)?\s+.*?\s+for|maintenance|subsistence|"
+    r"provisions?\s+issued|victualled|accommodated\s+on\s+board|provision\s+account|"
+    r"certificate\s+delivered|grant\s+certificate|manumission\s+certificate"
+    r")\b",
+    flags=re.I | re.S,
+)
+STATEMENT_REPORT_PAT = re.compile(
+    r"\b(statement\s+of|statement\s+made\s+by|i\s+was\s+born|i\s+was\s+kidnapped|i\s+request)\b",
     flags=re.I,
 )
 
@@ -1576,7 +1603,9 @@ def model_page_decision(client: "OllamaClient", ocr: str, stats: CallStats, *, r
         return PageDecision(True, None, choose_report_type(report_type_override), "override")
     schema = '{"should_extract":true,"skip_reason":null,"report_type":"statement","evidence":"..."}'
     obj = client.generate_json(render_prompt(PAGE_CLASSIFY_PROMPT, ocr=ocr), schema, stats, num_predict=500)
-    return parse_page_decision(obj)
+    decision = parse_page_decision(obj)
+    decision.report_type = override_report_type_from_ocr(ocr, decision.report_type)
+    return decision
 
 
 def model_named_people(client: "OllamaClient", ocr: str, stats: CallStats) -> List[Dict[str, str]]:
