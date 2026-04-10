@@ -444,7 +444,7 @@ OCR TEXT:
 <<<{ocr}>>>
 """
 
-PLACE_PASS_PROMPT = """You are extracting PAGE-LOCAL places for ONE named enslaved/manumission subject from ONE OCR page.
+PLACE_PASS_PROMPT = """You are extracting CANDIDATE PAGE-LOCAL places for ONE named enslaved/manumission subject from ONE OCR page.
 
 Target person: {name}
 
@@ -454,58 +454,45 @@ Return JSON only:
   "places": [
     {
       "place": string,
-      "order": integer,
-      "arrival_date": string | null,
-      "date_confidence": "explicit" | "derived_from_doc" | "unknown",
       "time_text": string | null,
       "evidence": string
     }
   ]
 }
 
-This is a page-local extraction task.
+This is a high-recall candidate-finding task.
 Use ONLY this page.
 
-What to extract:
-- every real named place explicitly linked to the target person on this page
+Task:
+Find every real named place explicitly linked to the target person on this page.
+
+Include:
 - birthplace / native place / residence / origin
 - kidnapped from / captured from / brought to / taken to / sold at / sent to / arrived at / reached / escaped to / took refuge at
-- actual origin, actual movement/transfer/arrival/refuge/presence, and any clearly arranged or formally proposed next destination for the target person on this page
+- actual origin, movement, transfer, arrival, refuge, or presence
+- any clearly arranged or formally proposed next destination for the target person on this page
+- shared places that clearly apply to the target person in grouped name lists or shared administrative lines
 
-Arrival date task:
-For EACH place row, try your best to recover the date tied to the target person's connection to that place on this page.
-- use arrival_date only when the page explicitly states a date for that place/movement/presence OR when the date is clearly derived from the page date for that handling event
-- if the page is a statement recorded on a known date and the target person is explicitly at that place on that page, you may use the statement date with date_confidence="derived_from_doc"
-- if the page is a certificate, delivery, recommendation, forwarding, repatriation, release, or handling page and a place is clearly the handling/delivery place for the target person, you may use the page date with date_confidence="derived_from_doc"
-- if the page gives only partial timing such as "May 1931", "five years ago", "some months ago", or "on arrival", leave arrival_date null and put that wording in time_text
-- never invent a full date when the page only gives month/year or vague relative time
+Do NOT do these tasks here:
+- do NOT assign final route order
+- do NOT decide order = 0 versus positive route step
+- do NOT infer final arrival_date
+- do NOT infer date_confidence from the page date
 
-Order rules:
-- use order = 1,2,3,... for any place that the page clearly shows as an actual life-route step, completed movement, present location, source location, or arrival/destination in a forwarding chain
-- if the page gives a confident source→destination or arrival statement such as "from X", "forwarded ... arriving Y", "reached Y", "arrived Y", "escaped to Y", or "went to Y", do NOT use order = 0 for those places
-- use order = 0 only when the place is relevant but the target person's arrival/presence there is not sufficiently certain, including:
-  * office or agency location not clearly linked as the subject's own location
-  * memo forwarding point only
-  * certificate delivery point only
-  * requested future residence
-  * intended destination not clearly completed
-  * repatriation target not clearly completed
-  * administrative handling location only
-
-Shared-list rules:
-- if a sentence or paragraph governs several listed names, and the target person is one of them, apply the shared place to the target person too
-- grouped recommendation or certificate pages can still yield valid order=0 places
-- if a grouped page names several people and one handling location/date applies to all of them, return that place/date for each applicable target person
+time_text rules:
+- use time_text only for a raw timing phrase directly attached to that place, such as "May 1931", "five years ago", "on arrival", or "about the 17th"
+- keep the wording short and literal
+- leave time_text null when there is no such attached timing phrase
 
 What NOT to extract:
 - ship names
 - office titles instead of places
 - generic words like agency, residency, office, there, here, sea
-- places that belong only to a correspondent or recipient and are not clearly linked to the target person
+- places that belong only to a correspondent, official, or recipient and are not clearly linked to the target person
 
 Evidence rules:
 - every place needs a short supporting quote or phrase, max 25 words
-- every non-null arrival_date should be supported by evidence tied to that place
+- evidence should support the place-target linkage, not final ordering
 
 Output JSON only.
 
@@ -549,11 +536,11 @@ OCR TEXT:
 <<<{ocr}>>>
 """
 
-PLACE_VERIFY_PROMPT = """You are doing FINAL verification and canonicalization of page-local places for ONE named enslaved/manumission subject.
+PLACE_VERIFY_PROMPT = """You are doing FINAL adjudication of page-local places for ONE named enslaved/manumission subject.
 
 Target person: {name}
 Page number: {page}
-Candidate place rows already extracted (may contain mistakes, duplicates, or inconsistent ordering):
+Candidate place mentions already extracted (high-recall candidates, may include false positives, duplicates, OCR variants, or raw timing text):
 {candidate_places_json}
 
 Return JSON only:
@@ -572,39 +559,37 @@ Return JSON only:
 }
 
 Task:
-Produce the COMPLETE FINAL place list for this target person on this page.
-Use the OCR text plus the candidate rows. You may drop wrong places, merge duplicates, normalize OCR variants to the same real place, fix ordering, and fix date/time fields.
-Do not add speculative places.
+Using the OCR text plus the candidate place mentions, produce the COMPLETE FINAL place list for this target person on this page.
+
+Important:
+- Start from the candidate list.
+- Keep only places that truly belong to the target person's own page-local route, presence, origin, refuge, transfer, arrival, or clearly arranged next movement.
+- You may drop wrong candidates, merge duplicates, normalize OCR variants to one place, assign route order, and improve date fields.
+- Do not add speculative places.
 
 Core rules:
-- Extract only places that truly belong to the target person's own page-local route, presence, origin, refuge, transfer, arrival, or formally arranged next movement on this page.
-- Relative or owner places do not belong to the target unless the page clearly says the target person was also there.
+- Relative, owner, correspondent, writer, or recipient places do not belong to the target unless the page clearly says the target person was also there.
 - Ship names are never places.
-- "house of X", "household of X", and similar household descriptions are not standalone places unless they clearly name a real settlement/place.
+- "house of X" or "household of X" is not a place unless it clearly names a real settlement/place.
 - Generic office words like office, here, there are not places.
-- Agency / Political Agency may be kept when the page clearly says the target person is there or took refuge there.
+- Agency / Political Agency may be kept only when the page clearly says the target person is there or took refuge there.
 
 Order rules:
-- Use order = 1,2,3,... for the target person's ordered route on this page.
-- A place may have positive order even if arrival_date is blank, when the page clearly frames it as the next formal movement step.
-- This includes wording such as sent to, sending him to, to be sent to, forwarded to, for delivery to, repatriation to, arranged with ... for, or equivalent formal next-step movement.
-- Use order = 0 only for relevant places that are background-only, weakly linked, generic administration, or not clearly part of the route sequence.
-- Make the final positive-order sequence internally consistent with the page's time wording and evidence.
+- Use order = 1,2,3,... only for places that the page clearly supports as part of the target person's route, presence, origin, refuge, transfer, arrival, or formally arranged next movement.
+- A place may have positive order even when arrival_date is blank, if the page clearly frames it as the next formal movement step.
+- Use order = 0 for relevant places that are administrative-only, background-only, weakly linked, or not clearly part of the route sequence.
+- Positive orders must form one consecutive sequence 1..n.
 
-Date/time rules:
-- Keep arrival_date only when explicitly stated or clearly derivable from the page date for that place-event.
-- If a place is a formal next step but not yet completed, it may still have positive order with blank arrival_date.
-- Put proposal or arrangement wording into time_text rather than forcing order = 0.
-- Ensure order, arrival_date, and time_text do not contradict each other.
-
-Duplicate/canonicalization rules:
-- Each final place should appear only once.
-- If two candidates are OCR variants of the same place, keep one canonical place string.
-- Return the final complete list, not only corrections.
+Date and time rules:
+- Use arrival_date only when the date is explicitly stated for that place-event, or when it is clearly derivable from the page date for that handling/presence/delivery/recommendation/statement event.
+- Use date_confidence = explicit only for directly stated dates.
+- Use date_confidence = derived_from_doc only when the page date clearly dates that place-event.
+- If the page gives only partial or vague timing, leave arrival_date null and preserve that wording in time_text.
+- Do not invent full dates.
 
 Evidence rules:
-- Every place needs a short supporting quote or phrase, max 25 words.
-- Evidence should support both the place and why it belongs in that position.
+- Every final place needs a short supporting quote or phrase, max 25 words.
+- Evidence should support why the place belongs to the target and, when possible, why its order/date assignment is justified.
 
 Output JSON only.
 
@@ -1636,34 +1621,26 @@ def model_meta_for_name(client: "OllamaClient", ocr: str, name: str, page: int, 
 
 def model_places_for_name(client: "OllamaClient", ocr: str, name: str, page: int, stats: CallStats) -> List[Dict[str, Any]]:
     doc_year = extract_doc_year(ocr)
-    schema = '{"name":"%s","places":[{"place":"...","order":0,"arrival_date":null,"date_confidence":"unknown","time_text":null,"evidence":"..."}]}' % name
+    candidate_schema = '{"name":"%s","places":[{"place":"...","time_text":null,"evidence":"..."}]}' % name
+    final_schema = '{"name":"%s","places":[{"place":"...","order":0,"arrival_date":null,"date_confidence":"unknown","time_text":null,"evidence":"..."}]}' % name
 
-    first = parse_places(
-        client.generate_json(render_prompt(PLACE_PASS_PROMPT, name=name, ocr=ocr), schema, stats, num_predict=1200),
+    candidates = parse_places(
+        client.generate_json(render_prompt(PLACE_PASS_PROMPT, name=name, ocr=ocr), candidate_schema, stats, num_predict=1000),
         name,
         page,
         doc_year,
     )
-    second = parse_places(
-        client.generate_json(render_prompt(PLACE_RECALL_PROMPT, name=name, ocr=ocr), schema, stats, num_predict=1200),
-        name,
-        page,
-        doc_year,
-    )
-    merged = dedupe_place_rows(first + second, drop_internal=False)
-    if not merged:
+    candidates = dedupe_place_rows(candidates, drop_internal=False)
+    if not candidates:
         return []
 
     candidate_payload = json.dumps([
         {
             "place": row["Place"],
-            "order": row["Order"],
-            "arrival_date": row["Arrival Date"] or None,
-            "date_confidence": row["Date Confidence"] or "unknown",
             "time_text": row["Time Info"] or None,
             "evidence": row.get("_evidence") or None,
         }
-        for row in merged
+        for row in candidates
     ], ensure_ascii=False, indent=2)
 
     issues = ""
@@ -1676,7 +1653,7 @@ def model_places_for_name(client: "OllamaClient", ocr: str, name: str, page: int
             candidate_places_json=(candidate_payload if not issues else candidate_payload + "\n\nIssues to fix:\n- " + issues),
             ocr=ocr,
         )
-        verified_obj = client.generate_json(prompt, schema, stats, num_predict=1200)
+        verified_obj = client.generate_json(prompt, final_schema, stats, num_predict=1200)
         final_rows = parse_places(verified_obj, name, page, doc_year)
         final_rows = dedupe_place_rows(final_rows, drop_internal=False)
         issue = verify_place_rows_need_retry(final_rows)
@@ -1684,7 +1661,11 @@ def model_places_for_name(client: "OllamaClient", ocr: str, name: str, page: int
             return dedupe_place_rows(final_rows)
         issues = issue
 
-    return dedupe_place_rows(final_rows)
+    # Safe fallback: preserve validated candidate mentions as order-0 rows
+    # rather than dropping all place information when final adjudication fails.
+    if final_rows:
+        return dedupe_place_rows(final_rows)
+    return dedupe_place_rows(candidates)
 
 
 # ---------------------------------------------------------------------------
